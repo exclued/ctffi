@@ -10,7 +10,7 @@ This document explores the possibility of using **CTF (Compact Type Format)** de
 
 CTF is a compact binary format for storing type information, originally developed for Solaris and later adopted in ELF binaries (particularly on Linux with binutils 2.37+ and glibc 2.34+). Key characteristics:
 
-- **Compact**: More space-efficient than DWARF debug info
+- **Compact**: More space-efficient than other debug info formats
 - **Binary format**: Stored in ELF sections (`.ctf`, `.ctf_info`)
 - **Type information**: Contains complete type descriptions including structs, unions, enums, functions, arrays, and pointers
 - **Runtime accessible**: Can be parsed at runtime without external tools
@@ -382,11 +382,10 @@ eu-readelf -S program | grep ctf
 
 ## Future Enhancements
 
-1. **DWARF Support**: Extend to use DWARF debug info as alternative
-2. **BTF Integration**: Support BPF Type Format (similar to CTF)
-3. **Language Bindings**: Python, Rust, Go interfaces
-4. **JIT Compilation**: Generate optimized call stubs
-5. **Remote Debugging**: Network protocol for remote type queries
+1. **BTF Integration**: Support BPF Type Format (similar to CTF)
+2. **Language Bindings**: Python, Rust, Go interfaces
+3. **JIT Compilation**: Generate optimized call stubs
+4. **Remote Debugging**: Network protocol for remote type queries
 
 ## Related Projects
 
