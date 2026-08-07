@@ -105,11 +105,7 @@ static int member_cb(const char *name, ctf_id_t member_type,
     member_builder_t *b = arg;
     ffi_type *type;
     (void)name;
-
-    if (offset % 8 != 0) {
-        b->error = 1;
-        return 1;
-    }
+    (void)offset;
     type = ctf_to_ffi_type(b->ctx, member_type);
     if (!type || append_member(b, type) != 0) {
         b->error = 1;
@@ -121,6 +117,13 @@ static int member_cb(const char *name, ctf_id_t member_type,
 static int layout_type(ffi_type *type) {
     ffi_cif cif;
     return ffi_prep_cif(&cif, FFI_DEFAULT_ABI, 0, type, NULL) == FFI_OK ? 0 : -1;
+}
+
+static size_t round_up(size_t value, unsigned alignment) {
+    if (alignment <= 1)
+        return value;
+    size_t a = alignment;
+    return (value + a - 1) / a * a;
 }
 
 static ffi_type *aggregate_type(ctf_ffi_context_t *ctx, ctf_id_t id,
@@ -143,7 +146,7 @@ static ffi_type *aggregate_type(ctf_ffi_context_t *ctx, ctf_id_t id,
     if (is_union) {
         ffi_type *largest = NULL;
         size_t max_size = 0;
-        unsigned short max_alignment = 0;
+        unsigned max_alignment = 1;
         for (size_t i = 0; i < b.count; ++i) {
             if (layout_type(b.elements[i]) != 0) {
                 free(b.elements);
@@ -163,8 +166,8 @@ static ffi_type *aggregate_type(ctf_ffi_context_t *ctx, ctf_id_t id,
         }
         result->elements[0] = largest;
         result->elements[1] = NULL;
-        result->size = max_size;
-        result->alignment = max_alignment;
+        result->alignment = (unsigned short)max_alignment;
+        result->size = round_up(max_size, max_alignment);
         free(b.elements);
     } else {
         result->elements = realloc(b.elements, (b.count + 1) * sizeof(*result->elements));
@@ -265,7 +268,8 @@ void *call_function_via_ctf(const char *path, const char *name,
     }
     if (build_cif_from_ctf(&ctx, name, &cif, &rtype, &args, &actual) != 0 || actual != nargs)
         goto fail;
-    void (*fn)(void) = (void (*)(void))dlsym(handle, name);
+    void (*fn)(void) = NULL;
+    *(void **)(&fn) = dlsym(handle, name);
     if (!fn)
         goto fail;
     void *result = rtype->size ? calloc(1, rtype->size) : NULL;
