@@ -1,8 +1,8 @@
 /*
- * CTF-FFI Bridge: Proof of Concept Implementation
+ * CTF-FFI Bridge
  *
- * Use CTF debug metadata to discover C function signatures and construct
- * libffi call interfaces.
+ * Convert CTF type descriptions into libffi types and use them to call
+ * functions discovered from an ELF symbol table.
  */
 
 #include <stdio.h>
@@ -27,7 +27,36 @@ typedef struct {
     size_t cache_count;
 } ctf_ffi_context_t;
 
+typedef struct {
+    ctf_ffi_context_t *ctx;
+    ffi_type **elements;
+    size_t count;
+    size_t capacity;
+    int error;
+} aggregate_builder_t;
+
 static ffi_type *ctf_to_ffi_type(ctf_ffi_context_t *ctx, ctf_id_t type_id);
+
+static ffi_type *find_in_cache(ctf_ffi_context_t *ctx, ctf_id_t type_id) {
+    for (size_t i = 0; i < ctx->cache_count; ++i)
+        if (ctx->type_cache[i].ctf_type_id == type_id)
+            return ctx->type_cache[i].ffi_type;
+    return NULL;
+}
+
+static int add_to_cache(ctf_ffi_context_t *ctx, ctf_id_t type_id,
+                        ffi_type *type, int is_dynamic) {
+    if (ctx->cache_count >= TYPE_CACHE_SIZE) {
+        fprintf(stderr, "CTF type cache is full\n");
+        return -1;
+    }
+
+    ctx->type_cache[ctx->cache_count].ctf_type_id = type_id;
+    ctx->type_cache[ctx->cache_count].ffi_type = type;
+    ctx->type_cache[ctx->cache_count].is_dynamic = is_dynamic;
+    ++ctx->cache_count;
+    return 0;
+}
 
 int ctf_ffi_init(ctf_ffi_context_t *ctx, const char *lib_path) {
     int err;
@@ -70,27 +99,6 @@ void ctf_ffi_cleanup(ctf_ffi_context_t *ctx) {
         ctf_arc_close(ctx->arc);
 
     memset(ctx, 0, sizeof(*ctx));
-}
-
-static ffi_type *find_in_cache(ctf_ffi_context_t *ctx, ctf_id_t type_id) {
-    for (size_t i = 0; i < ctx->cache_count; ++i)
-        if (ctx->type_cache[i].ctf_type_id == type_id)
-            return ctx->type_cache[i].ffi_type;
-    return NULL;
-}
-
-static int add_to_cache(ctf_ffi_context_t *ctx, ctf_id_t type_id,
-                        ffi_type *type, int is_dynamic) {
-    if (ctx->cache_count >= TYPE_CACHE_SIZE) {
-        fprintf(stderr, "CTF type cache is full\n");
-        return -1;
-    }
-
-    ctx->type_cache[ctx->cache_count].ctf_type_id = type_id;
-    ctx->type_cache[ctx->cache_count].ffi_type = type;
-    ctx->type_cache[ctx->cache_count].is_dynamic = is_dynamic;
-    ++ctx->cache_count;
-    return 0;
 }
 
 static ffi_type *ctf_integer_to_ffi(ctf_file_t *ctf, ctf_id_t type_id) {
@@ -145,32 +153,167 @@ static ffi_type *ctf_float_to_ffi(ctf_file_t *ctf, ctf_id_t type_id) {
     }
 }
 
+static int append_element(aggregate_builder_t *builder, ffi_type *element) {
+    if (builder->count == builder->capacity) {
+        size_t new_capacity = builder->capacity ? builder->capacity * 2 : 4;
+        ffi_type **new_elements = realloc(builder->elements,
+                                          new_capacity * sizeof(*new_elements));
+        if (!new_elements)
+            return -1;
+        builder->elements = new_elements;
+        builder->capacity = new_capacity;
+    }
+
+    builder->elements[builder->count++] = element;
+    return 0;
+}
+
+static int aggregate_member(const char *name, ctf_id_t member_type,
+                            unsigned long offset, void *arg) {
+    aggregate_builder_t *builder = arg;
+    (void)name;
+
+    /* libffi has no bit-field support. */
+    if (offset % 8 != 0) {
+        fprintf(stderr, "Bit-field members are not supported\n");
+        builder->error = 1;
+        return 1;
+    }
+
+    ffi_type *element = ctf_to_ffi_type(builder->ctx, member_type);
+    if (!element || append_element(builder, element) != 0) {
+        builder->error = 1;
+        return 1;
+    }
+
+    return 0;
+}
+
+static int prepare_layout(ffi_type *type) {
+    ffi_cif cif;
+    return ffi_prep_cif(&cif, FFI_DEFAULT_ABI, 0, type, NULL) == FFI_OK ? 0 : -1;
+}
+
 static ffi_type *ctf_struct_to_ffi(ctf_ffi_context_t *ctx, ctf_id_t type_id) {
     ffi_type *ffi_struct = calloc(1, sizeof(*ffi_struct));
+    aggregate_builder_t builder = { .ctx = ctx };
+
     if (!ffi_struct)
         return NULL;
 
-    /* Aggregate layout is deliberately left opaque until Phase 1. */
+    /* Cache the placeholder before descending into nested members. */
     ffi_struct->type = FFI_TYPE_STRUCT;
-    ffi_struct->size = ctf_type_size(ctx->ctf, type_id);
-    ffi_struct->alignment = ctf_type_align(ctx->ctf, type_id);
-    ffi_struct->elements = NULL;
-
     if (add_to_cache(ctx, type_id, ffi_struct, 1) != 0) {
         free(ffi_struct);
         return NULL;
     }
+
+    if (ctf_member_iter(ctx->ctf, type_id, aggregate_member, &builder) != 0 ||
+        builder.error) {
+        free(builder.elements);
+        return NULL;
+    }
+
+    ffi_type **elements = realloc(builder.elements,
+                                  (builder.count + 1) * sizeof(*elements));
+    if (!elements) {
+        free(builder.elements);
+        return NULL;
+    }
+    elements[builder.count] = NULL;
+    ffi_struct->elements = elements;
+
+    if (prepare_layout(ffi_struct) != 0 ||
+        (ssize_t)ffi_struct->size != ctf_type_size(ctx->ctf, type_id) ||
+        ffi_struct->alignment != ctf_type_align(ctx->ctf, type_id)) {
+        fprintf(stderr, "CTF/libffi layout mismatch for struct type %lld\n",
+                (long long)type_id);
+        return NULL;
+    }
+
     return ffi_struct;
 }
 
+static ffi_type *ctf_union_to_ffi(ctf_ffi_context_t *ctx, ctf_id_t type_id) {
+    aggregate_builder_t builder = { .ctx = ctx };
+    ffi_type *ffi_union = calloc(1, sizeof(*ffi_union));
+    ffi_type **elements;
+
+    if (!ffi_union)
+        return NULL;
+
+    /* Cache a placeholder so nested pointers/types can refer back to it. */
+    ffi_union->type = FFI_TYPE_STRUCT;
+    if (add_to_cache(ctx, type_id, ffi_union, 1) != 0) {
+        free(ffi_union);
+        return NULL;
+    }
+
+    if (ctf_member_iter(ctx->ctf, type_id, aggregate_member, &builder) != 0 ||
+        builder.error || builder.count == 0) {
+        free(builder.elements);
+        return NULL;
+    }
+
+    /* libffi emulates unions as a one-element struct.  Lay out every member
+       first, then select the largest member and the largest alignment. */
+    ffi_type *largest = builder.elements[0];
+    for (size_t i = 0; i < builder.count; ++i) {
+        if (prepare_layout(builder.elements[i]) != 0) {
+            free(builder.elements);
+            return NULL;
+        }
+        if (builder.elements[i]->size > largest->size)
+            largest = builder.elements[i];
+    }
+
+    elements = malloc(2 * sizeof(*elements));
+    if (!elements) {
+        free(builder.elements);
+        return NULL;
+    }
+    elements[0] = largest;
+    elements[1] = NULL;
+    free(builder.elements);
+
+    ffi_union->elements = elements;
+    ffi_union->size = largest->size;
+    ffi_union->alignment = largest->alignment;
+
+    ssize_t ctf_size = ctf_type_size(ctx->ctf, type_id);
+    unsigned short ctf_alignment = ctf_type_align(ctx->ctf, type_id);
+    if (ctf_size < 0 || (size_t)ctf_size != ffi_union->size ||
+        ctf_alignment != ffi_union->alignment) {
+        fprintf(stderr, "CTF/libffi layout mismatch for union type %lld\n",
+                (long long)type_id);
+        return NULL;
+    }
+
+    return ffi_union;
+}
+
 static ffi_type *ctf_to_ffi_type(ctf_ffi_context_t *ctx, ctf_id_t type_id) {
-    ffi_type *cached = find_in_cache(ctx, type_id);
+    ffi_type *cached;
+    int kind;
+    ffi_type *result = NULL;
+
+    if (!ctx || type_id == CTF_ERR)
+        return NULL;
+
+    cached = find_in_cache(ctx, type_id);
     if (cached)
         return cached;
 
-    int kind = ctf_type_kind(ctx->ctf, type_id);
-    ffi_type *result = NULL;
+    /* Resolve typedefs and qualifiers before selecting the libffi type. */
+    type_id = ctf_type_resolve(ctx->ctf, type_id);
+    if (type_id == CTF_ERR)
+        return NULL;
 
+    cached = find_in_cache(ctx, type_id);
+    if (cached)
+        return cached;
+
+    kind = ctf_type_kind(ctx->ctf, type_id);
     switch (kind) {
     case CTF_K_INTEGER:
         result = ctf_integer_to_ffi(ctx->ctf, type_id);
@@ -183,30 +326,21 @@ static ffi_type *ctf_to_ffi_type(ctf_ffi_context_t *ctx, ctf_id_t type_id) {
         result = &ffi_type_pointer;
         break;
     case CTF_K_STRUCT:
-    case CTF_K_UNION:
         result = ctf_struct_to_ffi(ctx, type_id);
+        break;
+    case CTF_K_UNION:
+        result = ctf_union_to_ffi(ctx, type_id);
         break;
     case CTF_K_ENUM:
         result = &ffi_type_sint32;
         break;
     case CTF_K_ARRAY:
-        /* Function parameters are adjusted to pointers by the C language. */
+        /* Arrays in C function parameters are adjusted to pointers. */
         result = &ffi_type_pointer;
         break;
     default:
         fprintf(stderr, "Unsupported CTF type kind: %d\n", kind);
         break;
-    }
-
-    if (!result)
-        return NULL;
-
-    if (kind != CTF_K_STRUCT && kind != CTF_K_UNION &&
-        kind != CTF_K_INTEGER && kind != CTF_K_FLOAT &&
-        kind != CTF_K_POINTER && kind != CTF_K_FUNCTION &&
-        kind != CTF_K_ARRAY) {
-        if (add_to_cache(ctx, type_id, result, 0) != 0)
-            return NULL;
     }
 
     return result;
@@ -225,17 +359,12 @@ int build_cif_from_ctf(ctf_ffi_context_t *ctx, const char *func_name,
     if (!ctx || !func_name || !cif || !rtype || !args_out || !nargs_out)
         return -1;
 
-    /* Function names live in the ELF symbol namespace, not the C type
-       namespace.  ctf_lookup_by_name() therefore cannot find ordinary
-       functions such as add_numbers(). */
     func_type_id = ctf_lookup_by_symbol_name(ctx->ctf, func_name);
     if (func_type_id == CTF_ERR) {
         fprintf(stderr, "Function '%s' not found in CTF\n", func_name);
         return -1;
     }
 
-    /* func_type_id is a CTF_K_FUNCTION type ID, so use the _type_ APIs.
-       ctf_func_info()/ctf_func_args() take ELF symbol indexes instead. */
     err = ctf_func_type_info(ctx->ctf, func_type_id, &finfo);
     if (err != 0) {
         fprintf(stderr, "Failed to get function info for '%s'\n", func_name);
@@ -381,8 +510,6 @@ int list_ctf_functions(const char *lib_path) {
         }
     }
 
-    /* ctf_type_next() returns CTF_ERR both on normal end-of-iteration and
-       on errors.  Distinguish the two before reporting success. */
     if (ctf_errno(ctf) != ECTF_NEXT_END) {
         fprintf(stderr, "Failed while iterating CTF types: %s\n",
                 ctf_errmsg(ctf_errno(ctf)));
@@ -397,6 +524,32 @@ int list_ctf_functions(const char *lib_path) {
 }
 
 #ifdef STANDALONE_TEST
+static int run_struct_tests(const char *lib_path) {
+    typedef struct { int x; int y; } Point2D;
+    Point2D p1 = { 0, 0 };
+    Point2D p2 = { 3, 4 };
+    void *args[2] = { &p1, &p2 };
+    int *distance = call_function_via_ctf(lib_path, "point_distance", args, 2);
+    if (!distance || *distance != 25) {
+        free(distance);
+        fprintf(stderr, "point_distance test failed\n");
+        return -1;
+    }
+    free(distance);
+
+    int x = 10, y = 20;
+    void *create_args[2] = { &x, &y };
+    Point2D *point = call_function_via_ctf(lib_path, "create_point",
+                                           create_args, 2);
+    if (!point || point->x != 10 || point->y != 20) {
+        free(point);
+        fprintf(stderr, "create_point test failed\n");
+        return -1;
+    }
+    free(point);
+    return 0;
+}
+
 int main(int argc, char *argv[]) {
     if (argc != 3) {
         fprintf(stderr, "Usage: %s <library.so> <function>\n", argv[0]);
@@ -404,6 +557,9 @@ int main(int argc, char *argv[]) {
     }
 
     if (list_ctf_functions(argv[1]) != 0)
+        return 1;
+
+    if (run_struct_tests(argv[1]) != 0)
         return 1;
 
     printf("Calling %s\n", argv[2]);
