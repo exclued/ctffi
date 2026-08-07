@@ -1,5 +1,6 @@
 #include "ctffi.h"
 
+#include <dlfcn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -34,7 +35,7 @@ static void dump_ffi_type(const char *label, ffi_type *type, int depth) {
     LOG("%*s%s: ptr=%p type=%u size=%zu align=%u elements=%p",
         depth * 2, "", label, (void *)type, type->type, type->size,
         type->alignment, (void *)type->elements);
-    if (type->type == FFI_TYPE_STRUCT && type->elements && depth < 4) {
+    if (type->type == FFI_TYPE_STRUCT && type->elements && depth < 5) {
         for (size_t i = 0; type->elements[i]; ++i) {
             char child[32];
             snprintf(child, sizeof(child), "element[%zu]", i);
@@ -43,15 +44,36 @@ static void dump_ffi_type(const char *label, ffi_type *type, int depth) {
     }
 }
 
+static void dump_struct_offsets(const char *label, ffi_type *type) {
+    if (!type || type->type != FFI_TYPE_STRUCT || !type->elements)
+        return;
+    size_t count = 0;
+    while (type->elements[count])
+        ++count;
+    size_t *offsets = calloc(count ? count : 1, sizeof(*offsets));
+    if (!offsets) {
+        LOG("%s offsets: allocation failed", label);
+        return;
+    }
+    ffi_status status = ffi_get_struct_offsets(FFI_DEFAULT_ABI, type, offsets);
+    LOG("%s offsets: status=%d", label, status);
+    if (status == FFI_OK)
+        for (size_t i = 0; i < count; ++i)
+            LOG("  %s[%zu] offset=%zu", label, i, offsets[i]);
+    free(offsets);
+}
+
 static void dump_cif(const char *label, const ffi_cif *cif) {
     LOG("%s: cif=%p abi=%u nargs=%u bytes=%u flags=%u rtype=%p args=%p",
         label, (void *)cif, cif->abi, cif->nargs, cif->bytes, cif->flags,
         (void *)cif->rtype, (void *)cif->arg_types);
     dump_ffi_type("return", cif->rtype, 1);
+    dump_struct_offsets("return", cif->rtype);
     for (unsigned i = 0; i < cif->nargs; ++i) {
         char name[32];
         snprintf(name, sizeof(name), "arg[%u]", i);
         dump_ffi_type(name, cif->arg_types[i], 1);
+        dump_struct_offsets(name, cif->arg_types[i]);
     }
 }
 
@@ -83,7 +105,6 @@ static int compare_cifs(const char *label, const ffi_cif *manual,
     LOG("=== CIF comparison: %s ===", label);
     dump_cif("manual", manual);
     dump_cif("automatic", automatic);
-
     if (manual->abi != automatic->abi ||
         manual->nargs != automatic->nargs ||
         manual->bytes != automatic->bytes ||
@@ -97,26 +118,16 @@ static int compare_cifs(const char *label, const ffi_cif *manual,
     return 0;
 }
 
-static int dump_ctf_function(ctf_ffi_context_t *ctx, const char *name,
-                             ctf_id_t *fn_out) {
+static int dump_ctf_function(ctf_ffi_context_t *ctx, const char *name) {
     ctf_id_t fn = ctf_lookup_by_symbol_name(ctx->ctf, name);
     ctf_funcinfo_t info;
     if (fn == CTF_ERR || ctf_func_type_info(ctx->ctf, fn, &info) != 0)
         FAIL("cannot inspect CTF function %s", name);
 
     LOG("=== CTF function: %s ===", name);
-    LOG("function type id=%lu return=%lu argc=%u variadic=%d",
+    LOG("function type id=%lu return=%lu argc=%u flags=%u",
         (unsigned long)fn, (unsigned long)info.ctc_return,
         info.ctc_argc, info.ctc_flags);
-
-    for (unsigned i = 0; i < info.ctc_argc; ++i) {
-        ctf_id_t arg;
-        if (ctf_func_type_args(ctx->ctf, fn, 1, &arg) != 0)
-            break;
-        /* The one-at-a-time API is not indexed; fetch the complete list below. */
-        (void)arg;
-        break;
-    }
 
     if (info.ctc_argc) {
         ctf_id_t *args = calloc(info.ctc_argc, sizeof(*args));
@@ -127,47 +138,29 @@ static int dump_ctf_function(ctf_ffi_context_t *ctx, const char *name,
             FAIL("cannot inspect arguments of %s", name);
         }
         for (unsigned i = 0; i < info.ctc_argc; ++i) {
-            ssize_t size = ctf_type_size(ctx->ctf, args[i]);
-            unsigned short align = ctf_type_align(ctx->ctf, args[i]);
-            const char *type_name = ctf_type_name(ctx->ctf, args[i], NULL, 0);
+            char type_name[256];
+            const char *name_result = ctf_type_name(ctx->ctf, args[i],
+                                                    type_name, sizeof(type_name));
             LOG("arg[%u]: id=%lu kind=%s name=%s size=%zd align=%u",
                 i, (unsigned long)args[i], kind_name(ctf_type_kind(ctx->ctf, args[i])),
-                type_name ? type_name : "<anonymous>", size, align);
+                name_result ? name_result : "<anonymous>",
+                ctf_type_size(ctx->ctf, args[i]), ctf_type_align(ctx->ctf, args[i]));
         }
         free(args);
     }
-    *fn_out = fn;
-    return 0;
-}
-
-static int make_manual_point_cif(ffi_cif *cif, ffi_type **args) {
-    static ffi_type *point_elements[] = {
-        &ffi_type_sint32,
-        &ffi_type_sint32,
-        NULL
-    };
-    static ffi_type point = { FFI_TYPE_STRUCT, 0, 0, point_elements };
-    static ffi_type *manual_args[] = { &point, &point };
-    if (ffi_prep_cif(&((ffi_cif){0}), FFI_DEFAULT_ABI, 0, &point, NULL) != FFI_OK)
-        return 1;
-    if (ffi_prep_cif(cif, FFI_DEFAULT_ABI, 2, &ffi_type_sint32, manual_args) != FFI_OK)
-        return 1;
-    *args = manual_args[0];
     return 0;
 }
 
 static int test_point_distance(const char *path) {
     ctf_ffi_context_t ctx;
     ffi_cif automatic, manual;
-    ffi_type *rtype = NULL, **auto_args = NULL, *manual_point = NULL;
+    ffi_type *rtype = NULL, **auto_args = NULL;
     size_t auto_nargs = 0;
 
     LOG("\n=== TEST point_distance: struct arguments ===");
     if (ctf_ffi_init(&ctx, path) != 0)
         FAIL("ctf_ffi_init failed");
-
-    ctf_id_t fn;
-    if (dump_ctf_function(&ctx, "point_distance", &fn) != 0) {
+    if (dump_ctf_function(&ctx, "point_distance") != 0) {
         ctf_ffi_cleanup(&ctx);
         return 1;
     }
@@ -179,32 +172,41 @@ static int test_point_distance(const char *path) {
     }
     dump_cif("automatic", &automatic);
 
-    LOG("Building reference CIF manually...");
+    LOG("Building reference CIF manually from { int, int }...");
     ffi_type *point_elements[] = { &ffi_type_sint32, &ffi_type_sint32, NULL };
     ffi_type point = { FFI_TYPE_STRUCT, 0, 0, point_elements };
     ffi_type *manual_args[] = { &point, &point };
-    manual_point = &point;
     if (ffi_prep_cif(&manual, FFI_DEFAULT_ABI, 2, &ffi_type_sint32,
                      manual_args) != FFI_OK) {
         free(auto_args);
         ctf_ffi_cleanup(&ctx);
         FAIL("manual CIF construction failed");
     }
+    dump_cif("manual", &manual);
 
-    if (compare_cifs("point_distance", &manual, &automatic)) {
+    if (auto_nargs != 2 || compare_cifs("point_distance", &manual, &automatic)) {
         free(auto_args);
         ctf_ffi_cleanup(&ctx);
         FAIL("manual and automatic CIF differ");
     }
-    (void)manual_point;
 
+    void *handle = dlopen(path, RTLD_NOW);
+    if (!handle) {
+        free(auto_args); ctf_ffi_cleanup(&ctx);
+        FAIL("dlopen failed: %s", dlerror());
+    }
+    void (*fn)(void) = (void (*)(void))dlsym(handle, "point_distance");
+    if (!fn) {
+        dlclose(handle); free(auto_args); ctf_ffi_cleanup(&ctx);
+        FAIL("dlsym failed: %s", dlerror());
+    }
     Point2D p1 = { 0, 0 }, p2 = { 3, 4 };
     void *values[] = { &p1, &p2 };
-    LOG("Calling point_distance through automatic CIF...");
     int result = 0;
-    ffi_call(&automatic, FFI_FN((void (*)(void))dlsym(dlopen(path, RTLD_LAZY), "point_distance")),
-             &result, values);
+    LOG("Calling point_distance through automatic CIF...");
+    ffi_call(&automatic, FFI_FN(fn), &result, values);
     LOG("point_distance returned %d (expected 25)", result);
+    dlclose(handle);
     free(auto_args);
     ctf_ffi_cleanup(&ctx);
     if (result != 25)
@@ -213,11 +215,10 @@ static int test_point_distance(const char *path) {
 }
 
 static int test_create_point(const char *path) {
-    Point2D *result;
     int x = 10, y = 20;
     void *values[] = { &x, &y };
     LOG("\n=== TEST create_point: struct return ===");
-    result = call_function_via_ctf(path, "create_point", values, 2);
+    Point2D *result = call_function_via_ctf(path, "create_point", values, 2);
     if (!result)
         FAIL("create_point call failed");
     LOG("create_point returned {%d, %d} (expected {10, 20})", result->x, result->y);
