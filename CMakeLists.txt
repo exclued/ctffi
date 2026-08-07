@@ -22,7 +22,7 @@ if(NOT HAVE_GCTF)
     message(FATAL_ERROR "The compiler must support -gctf to build the CTF test library")
 endif()
 
-add_library(ctffi STATIC ctf_ffi_bridge.c)
+add_library(ctffi STATIC ctf_ffi_bridge_phase1.c)
 target_include_directories(ctffi PRIVATE ${CTF_INCLUDE_DIR})
 target_link_libraries(ctffi PRIVATE PkgConfig::LIBFFI ${CTF_LIBRARY} ${CMAKE_DL_LIBS})
 target_compile_definitions(ctffi PRIVATE HAVE_LIBCTF)
