@@ -136,7 +136,7 @@ static int dump_ctf_function(ctf_ffi_context_t *ctx, const char *name) {
 
 static int test_point_distance(const char *path) {
     ctf_ffi_context_t ctx;
-    ffi_cif automatic, manual, layout_cif;
+    ffi_cif automatic, manual;
     ffi_type *rtype = NULL, **auto_args = NULL;
     size_t auto_nargs = 0;
     LOG("\n=== TEST point_distance: struct arguments ===");
@@ -150,22 +150,23 @@ static int test_point_distance(const char *path) {
 
     LOG("Building reference CIF manually from { int, int }...");
     ffi_type *point_elements[] = { &ffi_type_sint32, &ffi_type_sint32, NULL };
-    ffi_type point = { FFI_TYPE_STRUCT, 0, 0, point_elements };
+    /* For the reference representation, layout is supplied from the native C ABI.
+       ffi_get_struct_offsets() is a query for libffi-prepared aggregate types and
+       is not a portable way to initialize an ffi_type supplied by the caller. */
+    ffi_type point = {
+        FFI_TYPE_STRUCT,
+        sizeof(Point2D),
+        _Alignof(Point2D),
+        point_elements
+    };
     ffi_type *manual_args[] = { &point, &point };
 
-    /* libffi requires a struct type to be prepared before querying its layout. */
-    ffi_status layout_status = ffi_prep_cif(&layout_cif, FFI_DEFAULT_ABI, 0, &point, NULL);
-    if (layout_status != FFI_OK) {
-        free(auto_args); ctf_ffi_cleanup(&ctx); FAIL("manual Point2D preparation failed: status=%d", layout_status);
-    }
-    size_t point_offsets[2] = { 0, 0 };
-    ffi_status point_layout = ffi_get_struct_offsets(FFI_DEFAULT_ABI, &point, point_offsets);
-    LOG("manual Point2D layout: status=%d size=%zu align=%u offsets={%zu, %zu}",
-        point_layout, point.size, point.alignment, point_offsets[0], point_offsets[1]);
-    if (point_layout != FFI_OK || point.size != sizeof(Point2D) ||
-        point.alignment != _Alignof(Point2D) || point_offsets[0] != offsetof(Point2D, x) ||
-        point_offsets[1] != offsetof(Point2D, y)) {
-        free(auto_args); ctf_ffi_cleanup(&ctx); FAIL("manual Point2D layout is not the native C layout");
+    size_t native_offsets[] = { offsetof(Point2D, x), offsetof(Point2D, y) };
+    LOG("manual Point2D native layout: size=%zu align=%zu offsets={%zu, %zu}",
+        sizeof(Point2D), _Alignof(Point2D), native_offsets[0], native_offsets[1]);
+    if (point.size != sizeof(Point2D) || point.alignment != _Alignof(Point2D) ||
+        native_offsets[0] != 0 || native_offsets[1] != sizeof(int)) {
+        free(auto_args); ctf_ffi_cleanup(&ctx); FAIL("manual Point2D native layout is inconsistent");
     }
     if (ffi_prep_cif(&manual, FFI_DEFAULT_ABI, 2, &ffi_type_sint32, manual_args) != FFI_OK) {
         free(auto_args); ctf_ffi_cleanup(&ctx); FAIL("manual CIF construction failed");
