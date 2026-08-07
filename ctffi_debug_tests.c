@@ -4,16 +4,10 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
-#define LOG(...) do { fprintf(stderr, "[ctffi-test] "); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); fflush(stderr); } while (0)
-#define FAIL(...) do { LOG("FAIL: " __VA_ARGS__); return 1; } while (0)
-#define CHECK_EQ(label, actual, expected) \
-    do { \
-        unsigned long long _a = (unsigned long long)(actual); \
-        unsigned long long _e = (unsigned long long)(expected); \
-        LOG("CHECK %-32s actual=%llu expected=%llu %s", label, _a, _e, _a == _e ? "OK" : "FAIL"); \
-        if (_a != _e) return 1; \
-    } while (0)
+#define LOG(...) do { fprintf(stderr, "[ctffi-test] "); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } while (0)
+#define FAIL(...) do { LOG("FAIL: "); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); return 1; } while (0)
 
 typedef struct { int x; int y; } Point2D;
 typedef struct { Point2D origin; double scale; } ScaledPoint;
@@ -35,11 +29,14 @@ static const char *kind_name(int kind) {
 }
 
 static void dump_ffi_type(const char *label, ffi_type *type, int depth) {
-    if (!type) { LOG("%*s%s: NULL", depth * 2, "", label); return; }
+    if (!type) {
+        LOG("%*s%s: NULL", depth * 2, "", label);
+        return;
+    }
     LOG("%*s%s: ptr=%p type=%u size=%zu align=%u elements=%p",
         depth * 2, "", label, (void *)type, type->type, type->size,
         type->alignment, (void *)type->elements);
-    if (type->type == FFI_TYPE_STRUCT && type->elements && depth < 8) {
+    if (type->type == FFI_TYPE_STRUCT && type->elements && depth < 5) {
         for (size_t i = 0; type->elements[i]; ++i) {
             char child[32];
             snprintf(child, sizeof(child), "element[%zu]", i);
@@ -49,7 +46,8 @@ static void dump_ffi_type(const char *label, ffi_type *type, int depth) {
 }
 
 static void dump_struct_offsets(const char *label, ffi_type *type) {
-    if (!type || type->type != FFI_TYPE_STRUCT || !type->elements) return;
+    if (!type || type->type != FFI_TYPE_STRUCT || !type->elements)
+        return;
     size_t count = 0;
     while (type->elements[count]) ++count;
     size_t *offsets = calloc(count ? count : 1, sizeof(*offsets));
@@ -63,7 +61,7 @@ static void dump_struct_offsets(const char *label, ffi_type *type) {
 }
 
 static void dump_cif(const char *label, const ffi_cif *cif) {
-    LOG("%s CIF: cif=%p abi=%u nargs=%u bytes=%u flags=%u rtype=%p args=%p",
+    LOG("%s: cif=%p abi=%u nargs=%u bytes=%u flags=%u rtype=%p args=%p",
         label, (void *)cif, cif->abi, cif->nargs, cif->bytes, cif->flags,
         (void *)cif->rtype, (void *)cif->arg_types);
     dump_ffi_type("return", cif->rtype, 1);
@@ -77,31 +75,21 @@ static void dump_cif(const char *label, const ffi_cif *cif) {
 }
 
 static int compare_type(const char *label, ffi_type *a, ffi_type *b) {
-    LOG("--- comparing %s ---", label);
+    LOG("Comparing %s", label);
     dump_ffi_type("manual", a, 1);
-    dump_ffi_type("automatic", b, 1);
-    if (!a || !b) {
-        LOG("type pointer presence: %s", a == b ? "OK" : "FAIL");
-        return a == b ? 0 : 1;
-    }
-    if (a->type != b->type) { LOG("type mismatch: manual=%u automatic=%u", a->type, b->type); return 1; }
-    if (a->size != b->size) { LOG("size mismatch: manual=%zu automatic=%zu", a->size, b->size); return 1; }
-    if (a->alignment != b->alignment) { LOG("alignment mismatch: manual=%u automatic=%u", a->alignment, b->alignment); return 1; }
+    dump_ffi_type("auto", b, 1);
+    if (!a || !b) return a == b ? 0 : 1;
+    if (a->type != b->type || a->size != b->size || a->alignment != b->alignment)
+        return 1;
     if (a->type == FFI_TYPE_STRUCT) {
         size_t i = 0;
         if (!a->elements || !b->elements) return a->elements == b->elements ? 0 : 1;
         while (a->elements[i] && b->elements[i]) {
-            char child[64];
-            snprintf(child, sizeof(child), "%s.element[%zu]", label, i);
-            if (compare_type(child, a->elements[i], b->elements[i])) return 1;
+            if (compare_type("struct element", a->elements[i], b->elements[i])) return 1;
             ++i;
         }
-        if (a->elements[i] || b->elements[i]) {
-            LOG("element count mismatch at %s", label);
-            return 1;
-        }
+        if (a->elements[i] || b->elements[i]) return 1;
     }
-    LOG("%s: types match", label);
     return 0;
 }
 
@@ -109,17 +97,12 @@ static int compare_cifs(const char *label, const ffi_cif *manual, const ffi_cif 
     LOG("=== CIF comparison: %s ===", label);
     dump_cif("manual", manual);
     dump_cif("automatic", automatic);
-    CHECK_EQ("CIF abi", manual->abi, automatic->abi);
-    CHECK_EQ("CIF nargs", manual->nargs, automatic->nargs);
-    CHECK_EQ("CIF bytes", manual->bytes, automatic->bytes);
-    CHECK_EQ("CIF flags", manual->flags, automatic->flags);
+    if (manual->abi != automatic->abi || manual->nargs != automatic->nargs ||
+        manual->bytes != automatic->bytes || manual->flags != automatic->flags)
+        return 1;
     if (compare_type("return type", manual->rtype, automatic->rtype)) return 1;
-    for (unsigned i = 0; i < manual->nargs; ++i) {
-        char label_arg[64];
-        snprintf(label_arg, sizeof(label_arg), "argument[%u]", i);
-        if (compare_type(label_arg, manual->arg_types[i], automatic->arg_types[i])) return 1;
-    }
-    LOG("CIF comparison: PASS");
+    for (unsigned i = 0; i < manual->nargs; ++i)
+        if (compare_type("argument type", manual->arg_types[i], automatic->arg_types[i])) return 1;
     return 0;
 }
 
@@ -158,7 +141,8 @@ static int test_point_distance(const char *path) {
     size_t auto_nargs = 0;
     LOG("\n=== TEST point_distance: struct arguments ===");
     LOG("Native Point2D: sizeof=%zu align=%zu offsetof(x)=%zu offsetof(y)=%zu sizeof(int)=%zu align(int)=%zu",
-        sizeof(Point2D), _Alignof(Point2D), offsetof(Point2D, x), offsetof(Point2D, y), sizeof(int), _Alignof(int));
+        sizeof(Point2D), _Alignof(Point2D), offsetof(Point2D, x), offsetof(Point2D, y),
+        sizeof(int), _Alignof(int));
     if (ctf_ffi_init(&ctx, path) != 0) FAIL("ctf_ffi_init failed");
     if (dump_ctf_function(&ctx, "point_distance") != 0) { ctf_ffi_cleanup(&ctx); return 1; }
     LOG("Building automatic CIF from CTF...");
@@ -169,31 +153,45 @@ static int test_point_distance(const char *path) {
 
     LOG("Building reference CIF manually from { int, int }...");
     ffi_type *point_elements[] = { &ffi_type_sint32, &ffi_type_sint32, NULL };
-    ffi_type point = { FFI_TYPE_STRUCT, sizeof(Point2D), _Alignof(Point2D), point_elements };
+    /* libffi ffi_type layout is: size, alignment, type, elements. */
+    ffi_type point = {
+        sizeof(Point2D),
+        _Alignof(Point2D),
+        FFI_TYPE_STRUCT,
+        point_elements
+    };
     ffi_type *manual_args[] = { &point, &point };
+
+    size_t native_offsets[] = { offsetof(Point2D, x), offsetof(Point2D, y) };
     LOG("Manual ffi_type Point2D: ptr=%p type=%u size=%zu align=%u elements=%p",
         (void *)&point, point.type, point.size, point.alignment, (void *)point.elements);
-    LOG("Manual element[0]: ptr=%p type=%u size=%zu align=%u native_offset=%zu",
-        (void *)&ffi_type_sint32, ffi_type_sint32.type, ffi_type_sint32.size,
-        ffi_type_sint32.alignment, offsetof(Point2D, x));
-    LOG("Manual element[1]: ptr=%p type=%u size=%zu align=%u native_offset=%zu",
-        (void *)&ffi_type_sint32, ffi_type_sint32.type, ffi_type_sint32.size,
-        ffi_type_sint32.alignment, offsetof(Point2D, y));
+    for (size_t i = 0; point_elements[i]; ++i)
+        LOG("Manual element[%zu]: ptr=%p type=%u size=%zu align=%u native_offset=%zu",
+            i, (void *)point_elements[i], point_elements[i]->type,
+            point_elements[i]->size, point_elements[i]->alignment, native_offsets[i]);
     LOG("Manual Point2D expected: size=%zu align=%zu offsets={%zu,%zu}",
-        sizeof(Point2D), _Alignof(Point2D), offsetof(Point2D, x), offsetof(Point2D, y));
-    CHECK_EQ("manual struct size", point.size, sizeof(Point2D));
-    CHECK_EQ("manual struct align", point.alignment, _Alignof(Point2D));
-    CHECK_EQ("manual field x offset", offsetof(Point2D, x), 0);
-    CHECK_EQ("manual field y offset", offsetof(Point2D, y), sizeof(int));
-    CHECK_EQ("manual field count", 2, 2);
+        sizeof(Point2D), _Alignof(Point2D), native_offsets[0], native_offsets[1]);
+    if (point.type != FFI_TYPE_STRUCT) {
+        free(auto_args); ctf_ffi_cleanup(&ctx); FAIL("manual struct type field is %u, expected FFI_TYPE_STRUCT=%u", point.type, FFI_TYPE_STRUCT);
+    }
+    if (point.size != sizeof(Point2D)) {
+        free(auto_args); ctf_ffi_cleanup(&ctx); FAIL("manual struct size=%zu, expected %zu", point.size, sizeof(Point2D));
+    }
+    if (point.alignment != _Alignof(Point2D)) {
+        free(auto_args); ctf_ffi_cleanup(&ctx); FAIL("manual struct alignment=%u, expected %zu", point.alignment, _Alignof(Point2D));
+    }
+    if (native_offsets[0] != 0 || native_offsets[1] != sizeof(int)) {
+        free(auto_args); ctf_ffi_cleanup(&ctx); FAIL("native Point2D offsets are unexpected");
+    }
 
-    LOG("Calling ffi_prep_cif() for manual CIF...");
+    LOG("Preparing manual CIF...");
     ffi_status manual_status = ffi_prep_cif(&manual, FFI_DEFAULT_ABI, 2, &ffi_type_sint32, manual_args);
-    LOG("ffi_prep_cif(manual): status=%d", manual_status);
-    if (manual_status != FFI_OK) { free(auto_args); ctf_ffi_cleanup(&ctx); FAIL("manual CIF construction failed"); }
+    LOG("manual ffi_prep_cif status=%d", manual_status);
+    if (manual_status != FFI_OK) {
+        free(auto_args); ctf_ffi_cleanup(&ctx); FAIL("manual CIF construction failed, status=%d", manual_status);
+    }
     dump_cif("manual", &manual);
-    if (auto_nargs != 2) { free(auto_args); ctf_ffi_cleanup(&ctx); FAIL("automatic nargs=%zu, expected 2", auto_nargs); }
-    if (compare_cifs("point_distance", &manual, &automatic)) {
+    if (auto_nargs != 2 || compare_cifs("point_distance", &manual, &automatic)) {
         free(auto_args); ctf_ffi_cleanup(&ctx); FAIL("manual and automatic CIF differ");
     }
 
@@ -210,7 +208,6 @@ static int test_point_distance(const char *path) {
     LOG("point_distance returned %d (expected 25)", result);
     dlclose(handle); free(auto_args); ctf_ffi_cleanup(&ctx);
     if (result != 25) FAIL("point_distance returned %d", result);
-    LOG("point_distance test: PASS");
     return 0;
 }
 
@@ -221,33 +218,30 @@ static int test_create_point(const char *path) {
     if (!result) FAIL("create_point call failed");
     LOG("create_point returned {%d, %d} (expected {10, 20})", result->x, result->y);
     if (result->x != 10 || result->y != 20) { free(result); FAIL("create_point result mismatch"); }
-    free(result); LOG("create_point test: PASS"); return 0;
+    free(result); return 0;
 }
 
 static int test_nested_struct(const char *path) {
     ScaledPoint input = { { 2, 3 }, 2.0 }; void *values[] = { &input };
     LOG("\n=== TEST scale_point: nested struct ===");
-    Point2D expected_origin = { 4, 6 };
-    LOG("Input: origin={%d,%d} scale=%.17g", input.origin.x, input.origin.y, input.scale);
-    LOG("Expected: origin={%d,%d} scale=%.17g", expected_origin.x, expected_origin.y, input.scale);
     ScaledPoint *result = call_function_via_ctf(path, "scale_point", values, 1);
     if (!result) FAIL("scale_point call failed");
-    LOG("scale_point returned {{%d, %d}, %.17g}", result->origin.x, result->origin.y, result->scale);
+    LOG("scale_point returned {{%d, %d}, %.3f} (expected {{4, 6}, 2.000})",
+        result->origin.x, result->origin.y, result->scale);
     if (result->origin.x != 4 || result->origin.y != 6 || result->scale != 2.0) {
         free(result); FAIL("scale_point result mismatch");
     }
-    free(result); LOG("scale_point test: PASS"); return 0;
+    free(result); return 0;
 }
 
 static int test_union(const char *path) {
     Number input = { .i = 1234 }; void *values[] = { &input };
     LOG("\n=== TEST union_int: union argument ===");
-    LOG("Native Number: sizeof=%zu align=%zu; input.i=%d", sizeof(Number), _Alignof(Number), input.i);
     int *result = call_function_via_ctf(path, "union_int", values, 1);
     if (!result) FAIL("union_int call failed");
     LOG("union_int returned %d (expected 1234)", *result);
     if (*result != 1234) { free(result); FAIL("union_int result mismatch"); }
-    free(result); LOG("union_int test: PASS"); return 0;
+    free(result); return 0;
 }
 
 int main(int argc, char **argv) {
