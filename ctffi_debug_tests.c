@@ -176,6 +176,22 @@ static int test_point_distance(const char *path) {
     ffi_type *point_elements[] = { &ffi_type_sint32, &ffi_type_sint32, NULL };
     ffi_type point = { FFI_TYPE_STRUCT, 0, 0, point_elements };
     ffi_type *manual_args[] = { &point, &point };
+
+    size_t point_offsets[2];
+    ffi_status point_layout = ffi_get_struct_offsets(FFI_DEFAULT_ABI, &point,
+                                                     point_offsets);
+    LOG("manual Point2D layout: status=%d size=%zu align=%u offsets={%zu, %zu}",
+        point_layout, point.size, point.alignment,
+        point_offsets[0], point_offsets[1]);
+    if (point_layout != FFI_OK || point.size != sizeof(Point2D) ||
+        point.alignment != _Alignof(Point2D) ||
+        point_offsets[0] != offsetof(Point2D, x) ||
+        point_offsets[1] != offsetof(Point2D, y)) {
+        free(auto_args);
+        ctf_ffi_cleanup(&ctx);
+        FAIL("manual Point2D layout is not the native C layout");
+    }
+
     if (ffi_prep_cif(&manual, FFI_DEFAULT_ABI, 2, &ffi_type_sint32,
                      manual_args) != FFI_OK) {
         free(auto_args);
