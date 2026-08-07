@@ -10,34 +10,31 @@ include(CheckCCompilerFlag)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBFFI REQUIRED IMPORTED_TARGET libffi)
 
-find_path(CTF_INCLUDE_DIR ctf-api.h)
-find_library(CTF_LIBRARY NAMES ctf)
-
-if(NOT CTF_INCLUDE_DIR OR NOT CTF_LIBRARY)
-    message(FATAL_ERROR "libctf development files are required")
-endif()
+find_path(CTF_INCLUDE_DIR ctf-api.h REQUIRED)
+find_library(CTF_LIBRARY NAMES ctf REQUIRED)
 
 check_c_compiler_flag("-gctf" HAVE_GCTF)
 if(NOT HAVE_GCTF)
-    message(FATAL_ERROR "The compiler must support -gctf to build the CTF test library")
+    message(FATAL_ERROR "The compiler must support -gctf to build the CTF test fixture")
 endif()
 
-add_library(ctffi STATIC ctf_ffi_bridge.c)
-target_include_directories(ctffi PRIVATE ${CTF_INCLUDE_DIR})
-target_link_libraries(ctffi PRIVATE PkgConfig::LIBFFI ${CTF_LIBRARY} ${CMAKE_DL_LIBS})
-target_compile_definitions(ctffi PRIVATE HAVE_LIBCTF)
+add_library(ctffi STATIC ctf_ffi_bridge_phase1.c)
+target_include_directories(ctffi PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${CTF_INCLUDE_DIR})
+target_link_libraries(ctffi PUBLIC PkgConfig::LIBFFI ${CTF_LIBRARY} ${CMAKE_DL_LIBS})
 target_compile_options(ctffi PRIVATE -Wall -Wextra -Wpedantic)
-
-add_executable(ctffi_test ctf_ffi_bridge.c)
-target_compile_definitions(ctffi_test PRIVATE STANDALONE_TEST HAVE_LIBCTF)
-target_include_directories(ctffi_test PRIVATE ${CTF_INCLUDE_DIR})
-target_link_libraries(ctffi_test PRIVATE PkgConfig::LIBFFI ${CTF_LIBRARY} ${CMAKE_DL_LIBS})
-target_compile_options(ctffi_test PRIVATE -Wall -Wextra -Wpedantic)
 
 add_library(test_ctf SHARED test_library.c)
 target_compile_options(test_ctf PRIVATE -gctf)
 
+# One diagnostic executable owns all integration tests. Keeping the test
+# harness separate from the library makes every CTF/libffi operation visible
+# in CI logs and permits manual-vs-automatic CIF comparisons.
+add_executable(ctffi_debug_tests ctffi_debug_tests.c)
+target_link_libraries(ctffi_debug_tests PRIVATE ctffi)
+target_compile_options(ctffi_debug_tests PRIVATE -Wall -Wextra -Wpedantic)
+
 include(CTest)
 if(BUILD_TESTING)
-    add_test(NAME smoke COMMAND ctffi_test $<TARGET_FILE:test_ctf> test_function_signature)
+    add_test(NAME phase1_aggregates
+             COMMAND ctffi_debug_tests $<TARGET_FILE:test_ctf>)
 endif()

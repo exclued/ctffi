@@ -1,8 +1,16 @@
 name: CI
 
 on:
-  push:
   pull_request:
+  push:
+    branches:
+      - main
+
+# Do not spend runner time on obsolete commits when several commits are pushed
+# to the same pull request in quick succession.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -15,6 +23,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake gcc binutils-dev libffi-dev pkg-config
+
+      - name: Verify CTF development files
+        run: |
+          test -f /usr/include/ctf-api.h
+          test -f /usr/lib/$(gcc -print-multiarch)/libctf.so
+          gcc --version
+          ld --version | head -n 1
 
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
