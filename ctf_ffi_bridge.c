@@ -1,8 +1,8 @@
 /*
  * CTF-FFI Bridge: Proof of Concept Implementation
- * 
- * This demonstrates using CTF debug metadata to provide type information
- * for libffi, enabling automatic function signature discovery.
+ *
+ * Use CTF debug metadata to discover C function signatures and construct
+ * libffi call interfaces.
  */
 
 #include <stdio.h>
@@ -12,41 +12,37 @@
 #include <ffi.h>
 #include <ctf-api.h>
 
-#define MAX_ARGS 16
 #define TYPE_CACHE_SIZE 256
 
-/* Type cache entry */
 typedef struct {
     ctf_id_t ctf_type_id;
     ffi_type *ffi_type;
-    int is_dynamic;  /* 1 if ffi_type was dynamically allocated */
+    int is_dynamic;
 } type_cache_entry_t;
 
-/* CTF-FFI context */
 typedef struct {
     ctf_archive_t *arc;
     ctf_file_t *ctf;
     type_cache_entry_t type_cache[TYPE_CACHE_SIZE];
-    int cache_count;
+    size_t cache_count;
 } ctf_ffi_context_t;
 
-/* Forward declarations */
-static ffi_type* ctf_to_ffi_type(ctf_ffi_context_t *ctx, ctf_id_t type_id);
+static ffi_type *ctf_to_ffi_type(ctf_ffi_context_t *ctx, ctf_id_t type_id);
 
-/* Initialize CTF-FFI context */
 int ctf_ffi_init(ctf_ffi_context_t *ctx, const char *lib_path) {
-    memset(ctx, 0, sizeof(*ctx));
-    
-    /* Open CTF archive - libctf API requires error code pointer */
     int err;
+
+    if (!ctx || !lib_path)
+        return -1;
+
+    memset(ctx, 0, sizeof(*ctx));
     ctx->arc = ctf_arc_open(lib_path, &err);
     if (!ctx->arc) {
-        fprintf(stderr, "Failed to open CTF archive for %s (error %d)\n", 
+        fprintf(stderr, "Failed to open CTF archive for %s (error %d)\n",
                 lib_path, err);
         return -1;
     }
-    
-    /* Bind to CTF file */
+
     ctx->ctf = ctf_arc_open_by_name(ctx->arc, NULL, &err);
     if (!ctx->ctf) {
         fprintf(stderr, "Failed to bind CTF (error %d)\n", err);
@@ -54,301 +50,310 @@ int ctf_ffi_init(ctf_ffi_context_t *ctx, const char *lib_path) {
         ctx->arc = NULL;
         return -1;
     }
-    
-    printf("CTF initialized successfully for %s\n", lib_path);
+
     return 0;
 }
 
-/* Cleanup CTF-FFI context */
 void ctf_ffi_cleanup(ctf_ffi_context_t *ctx) {
-    if (!ctx) return;
-    
-    /* Free dynamically allocated ffi_type structures */
-    for (int i = 0; i < ctx->cache_count; i++) {
-        if (ctx->type_cache[i].is_dynamic && ctx->type_cache[i].ffi_type) {
-            ffi_type *ft = ctx->type_cache[i].ffi_type;
-            
-            /* Free struct elements if present */
-            if (ft->type == FFI_TYPE_STRUCT && ft->elements) {
-                free(ft->elements);
-            }
-            
+    if (!ctx)
+        return;
+
+    for (size_t i = 0; i < ctx->cache_count; ++i) {
+        ffi_type *ft = ctx->type_cache[i].ffi_type;
+        if (ctx->type_cache[i].is_dynamic && ft) {
+            free(ft->elements);
             free(ft);
         }
     }
-    
-    /* Close CTF archive */
-    if (ctx->ctf) {
+
+    if (ctx->arc)
         ctf_arc_close(ctx->arc);
-    }
+
+    memset(ctx, 0, sizeof(*ctx));
 }
 
-/* Look up type in cache */
-static ffi_type* find_in_cache(ctf_ffi_context_t *ctx, ctf_id_t type_id) {
-    for (int i = 0; i < ctx->cache_count; i++) {
-        if (ctx->type_cache[i].ctf_type_id == type_id) {
+static ffi_type *find_in_cache(ctf_ffi_context_t *ctx, ctf_id_t type_id) {
+    for (size_t i = 0; i < ctx->cache_count; ++i)
+        if (ctx->type_cache[i].ctf_type_id == type_id)
             return ctx->type_cache[i].ffi_type;
-        }
-    }
     return NULL;
 }
 
-/* Add type to cache */
-static void add_to_cache(ctf_ffi_context_t *ctx, ctf_id_t type_id, 
-                         ffi_type *ffi_type, int is_dynamic) {
+static int add_to_cache(ctf_ffi_context_t *ctx, ctf_id_t type_id,
+                        ffi_type *type, int is_dynamic) {
     if (ctx->cache_count >= TYPE_CACHE_SIZE) {
-        fprintf(stderr, "Type cache full!\n");
-        return;
+        fprintf(stderr, "CTF type cache is full\n");
+        return -1;
     }
-    
+
     ctx->type_cache[ctx->cache_count].ctf_type_id = type_id;
-    ctx->type_cache[ctx->cache_count].ffi_type = ffi_type;
+    ctx->type_cache[ctx->cache_count].ffi_type = type;
     ctx->type_cache[ctx->cache_count].is_dynamic = is_dynamic;
-    ctx->cache_count++;
+    ++ctx->cache_count;
+    return 0;
 }
 
-/* Convert CTF integer type to ffi_type */
-static ffi_type* ctf_integer_to_ffi(ctf_file_t *ctf, ctf_id_t type_id) {
-    unsigned long size = ctf_type_size(ctf, type_id);
-    
-    switch (size) {
-        case 1: return &ffi_type_sint8;
-        case 2: return &ffi_type_sint16;
-        case 4: return &ffi_type_sint32;
-        case 8: return &ffi_type_sint64;
-        default:
-            fprintf(stderr, "Unsupported integer size: %lu\n", size);
-            return &ffi_type_void;
+static ffi_type *ctf_integer_to_ffi(ctf_file_t *ctf, ctf_id_t type_id) {
+    ctf_encoding_t encoding;
+    ssize_t size = ctf_type_size(ctf, type_id);
+
+    if (size < 0 || ctf_type_encoding(ctf, type_id, &encoding) != 0) {
+        fprintf(stderr, "Unable to read CTF integer encoding\n");
+        return NULL;
     }
-}
 
-/* Convert CTF float type to ffi_type */
-static ffi_type* ctf_float_to_ffi(ctf_file_t *ctf, ctf_id_t type_id) {
-    unsigned long size = ctf_type_size(ctf, type_id);
-    
     switch (size) {
-        case 4: return &ffi_type_float;
-        case 8: return &ffi_type_double;
-        default:
-            fprintf(stderr, "Unsupported float size: %lu\n", size);
-            return &ffi_type_void;
-    }
-}
-
-/* Convert CTF struct/union to ffi_type */
-static ffi_type* ctf_struct_to_ffi(ctf_ffi_context_t *ctx, ctf_id_t type_id) {
-    ctf_file_t *ctf = ctx->ctf;
-    unsigned long size = ctf_type_size(ctf, type_id);
-    
-    /* Allocate new ffi_type */
-    ffi_type *ffi_struct = calloc(1, sizeof(ffi_type));
-    if (!ffi_struct) {
+    case 0:
         return &ffi_type_void;
+    case 1:
+        return (encoding.cte_format & CTF_INT_SIGNED)
+            ? &ffi_type_sint8 : &ffi_type_uint8;
+    case 2:
+        return (encoding.cte_format & CTF_INT_SIGNED)
+            ? &ffi_type_sint16 : &ffi_type_uint16;
+    case 4:
+        return (encoding.cte_format & CTF_INT_SIGNED)
+            ? &ffi_type_sint32 : &ffi_type_uint32;
+    case 8:
+        return (encoding.cte_format & CTF_INT_SIGNED)
+            ? &ffi_type_sint64 : &ffi_type_uint64;
+    default:
+        fprintf(stderr, "Unsupported integer size: %zd bytes\n", size);
+        return NULL;
     }
-    
+}
+
+static ffi_type *ctf_float_to_ffi(ctf_file_t *ctf, ctf_id_t type_id) {
+    ctf_encoding_t encoding;
+
+    if (ctf_type_encoding(ctf, type_id, &encoding) != 0) {
+        fprintf(stderr, "Unable to read CTF floating-point encoding\n");
+        return NULL;
+    }
+
+    switch (encoding.cte_format) {
+    case CTF_FP_SINGLE:
+        return &ffi_type_float;
+    case CTF_FP_DOUBLE:
+        return &ffi_type_double;
+    case CTF_FP_LDOUBLE:
+        return &ffi_type_longdouble;
+    default:
+        fprintf(stderr, "Unsupported CTF floating-point encoding: %u\n",
+                encoding.cte_format);
+        return NULL;
+    }
+}
+
+static ffi_type *ctf_struct_to_ffi(ctf_ffi_context_t *ctx, ctf_id_t type_id) {
+    ffi_type *ffi_struct = calloc(1, sizeof(*ffi_struct));
+    if (!ffi_struct)
+        return NULL;
+
+    /* Aggregate layout is deliberately left opaque until Phase 1. */
     ffi_struct->type = FFI_TYPE_STRUCT;
-    ffi_struct->size = size;
-    
-    /* Get alignment from CTF */
-    ffi_struct->alignment = ctf_type_align(ctf, type_id);
-    
-    /* For now, set elements to NULL (opaque struct) */
-    /* TODO: Recursively process struct members */
+    ffi_struct->size = ctf_type_size(ctx->ctf, type_id);
+    ffi_struct->alignment = ctf_type_align(ctx->ctf, type_id);
     ffi_struct->elements = NULL;
-    
-    add_to_cache(ctx, type_id, ffi_struct, 1);
-    
+
+    if (add_to_cache(ctx, type_id, ffi_struct, 1) != 0) {
+        free(ffi_struct);
+        return NULL;
+    }
     return ffi_struct;
 }
 
-/* Main type conversion function */
-static ffi_type* ctf_to_ffi_type(ctf_ffi_context_t *ctx, ctf_id_t type_id) {
-    ctf_file_t *ctf = ctx->ctf;
-    
-    /* Check cache first */
+static ffi_type *ctf_to_ffi_type(ctf_ffi_context_t *ctx, ctf_id_t type_id) {
     ffi_type *cached = find_in_cache(ctx, type_id);
-    if (cached) {
+    if (cached)
         return cached;
-    }
-    
-    /* Get type kind */
-    int kind = ctf_type_kind(ctf, type_id);
-    
-    ffi_type *result;
+
+    int kind = ctf_type_kind(ctx->ctf, type_id);
+    ffi_type *result = NULL;
+
     switch (kind) {
-        case CTF_K_INTEGER:
-            result = ctf_integer_to_ffi(ctf, type_id);
-            break;
-            
-        case CTF_K_FLOAT:
-            result = ctf_float_to_ffi(ctf, type_id);
-            break;
-            
-        case CTF_K_POINTER:
-            result = &ffi_type_pointer;
-            break;
-            
-        case CTF_K_STRUCT:
-        case CTF_K_UNION:
-            result = ctf_struct_to_ffi(ctx, type_id);
-            break;
-            
-        case CTF_K_ENUM:
-            /* Treat enums as integers */
-            result = &ffi_type_sint32;
-            break;
-            
-        case CTF_K_ARRAY:
-            /* Arrays decay to pointers in FFI */
-            result = &ffi_type_pointer;
-            break;
-            
-        case CTF_K_FUNCTION:
-            /* Function types handled specially */
-            result = &ffi_type_pointer;
-            break;
-            
-        default:
-            fprintf(stderr, "Unknown CTF type kind: %d\n", kind);
-            result = &ffi_type_void;
-            break;
+    case CTF_K_INTEGER:
+        result = ctf_integer_to_ffi(ctx->ctf, type_id);
+        break;
+    case CTF_K_FLOAT:
+        result = ctf_float_to_ffi(ctx->ctf, type_id);
+        break;
+    case CTF_K_POINTER:
+    case CTF_K_FUNCTION:
+        result = &ffi_type_pointer;
+        break;
+    case CTF_K_STRUCT:
+    case CTF_K_UNION:
+        result = ctf_struct_to_ffi(ctx, type_id);
+        break;
+    case CTF_K_ENUM:
+        result = &ffi_type_sint32;
+        break;
+    case CTF_K_ARRAY:
+        /* Function parameters are adjusted to pointers by the C language. */
+        result = &ffi_type_pointer;
+        break;
+    default:
+        fprintf(stderr, "Unsupported CTF type kind: %d\n", kind);
+        break;
     }
-    
-    /* Cache non-primitive types */
-    if (kind != CTF_K_INTEGER && kind != CTF_K_FLOAT && 
-        kind != CTF_K_POINTER) {
-        add_to_cache(ctx, type_id, result, (kind == CTF_K_STRUCT || kind == CTF_K_UNION));
+
+    if (!result)
+        return NULL;
+
+    if (kind != CTF_K_STRUCT && kind != CTF_K_UNION &&
+        kind != CTF_K_INTEGER && kind != CTF_K_FLOAT &&
+        kind != CTF_K_POINTER && kind != CTF_K_FUNCTION &&
+        kind != CTF_K_ARRAY) {
+        if (add_to_cache(ctx, type_id, result, 0) != 0)
+            return NULL;
     }
-    
+
     return result;
 }
 
-/* Build ffi_cif from CTF function type */
 int build_cif_from_ctf(ctf_ffi_context_t *ctx, const char *func_name,
-                       ffi_cif *cif, ffi_type **rtype, ffi_type **args) {
-    ctf_file_t *ctf = ctx->ctf;
-    
-    /* Look up function type by name */
-    ctf_id_t func_type_id = ctf_lookup_by_name(ctf, func_name);
+                       ffi_cif *cif, ffi_type **rtype,
+                       ffi_type ***args_out, size_t *nargs_out) {
+    ctf_id_t func_type_id;
+    ctf_funcinfo_t finfo;
+    ctf_id_t *arg_types = NULL;
+    ffi_type **args = NULL;
+    size_t nargs;
+    int err;
+
+    if (!ctx || !func_name || !cif || !rtype || !args_out || !nargs_out)
+        return -1;
+
+    /* Function names live in the ELF symbol namespace, not the C type
+       namespace.  ctf_lookup_by_name() therefore cannot find ordinary
+       functions such as add_numbers(). */
+    func_type_id = ctf_lookup_by_symbol_name(ctx->ctf, func_name);
     if (func_type_id == CTF_ERR) {
         fprintf(stderr, "Function '%s' not found in CTF\n", func_name);
         return -1;
     }
-    
-    /* Get function info - libctf API uses different signature */
-    ctf_funcinfo_t finfo;
-    int err = ctf_func_info(ctf, func_type_id, &finfo);
+
+    /* func_type_id is a CTF_K_FUNCTION type ID, so use the _type_ APIs.
+       ctf_func_info()/ctf_func_args() take ELF symbol indexes instead. */
+    err = ctf_func_type_info(ctx->ctf, func_type_id, &finfo);
     if (err != 0) {
         fprintf(stderr, "Failed to get function info for '%s'\n", func_name);
         return -1;
     }
-    
-    /* Get argument types */
-    ctf_id_t arg_types[MAX_ARGS];
-    int nargs = finfo.ctc_argc;
-    if (nargs > MAX_ARGS) {
-        fprintf(stderr, "Too many arguments (%d) for function '%s'\n", nargs, func_name);
-        nargs = MAX_ARGS;
+
+    nargs = finfo.ctc_argc;
+    if (nargs > 0) {
+        arg_types = calloc(nargs, sizeof(*arg_types));
+        args = calloc(nargs, sizeof(*args));
+        if (!arg_types || !args) {
+            fprintf(stderr, "Out of memory allocating function arguments\n");
+            free(arg_types);
+            free(args);
+            return -1;
+        }
+
+        err = ctf_func_type_args(ctx->ctf, func_type_id, nargs, arg_types);
+        if (err != 0) {
+            fprintf(stderr, "Failed to get arguments for '%s'\n", func_name);
+            free(arg_types);
+            free(args);
+            return -1;
+        }
     }
-    
-    err = ctf_func_args(ctf, func_type_id, nargs, arg_types);
-    if (err != 0) {
-        fprintf(stderr, "Failed to get function arguments for '%s'\n", func_name);
-        return -1;
-    }
-    
-    printf("Function '%s': %d arguments\n", func_name, nargs);
-    
-    /* Convert return type */
+
     *rtype = ctf_to_ffi_type(ctx, finfo.ctc_return);
-    
-    /* Convert argument types */
-    for (int i = 0; i < nargs; i++) {
-        args[i] = ctf_to_ffi_type(ctx, arg_types[i]);
-        
-        /* Debug: print type info */
-        #ifdef DEBUG
-        int kind = ctf_type_kind(ctf, arg_types[i]);
-        printf("  Arg %d: kind=%d, size=%lu\n", i, kind, 
-               ctf_type_size(ctf, arg_types[i]));
-        #endif
-    }
-    
-    /* Prepare call interface */
-    ffi_status status = ffi_prep_cif(cif, FFI_DEFAULT_ABI, nargs, *rtype, args);
-    if (status != FFI_OK) {
-        fprintf(stderr, "Failed to prepare CIF\n");
+    if (!*rtype) {
+        free(arg_types);
+        free(args);
         return -1;
     }
-    
-    return nargs;
+
+    for (size_t i = 0; i < nargs; ++i) {
+        args[i] = ctf_to_ffi_type(ctx, arg_types[i]);
+        if (!args[i]) {
+            fprintf(stderr, "Unsupported type for argument %zu of '%s'\n",
+                    i, func_name);
+            free(arg_types);
+            free(args);
+            return -1;
+        }
+    }
+
+    ffi_status status = ffi_prep_cif(cif, FFI_DEFAULT_ABI, (unsigned)nargs,
+                                     *rtype, args);
+    if (status != FFI_OK) {
+        fprintf(stderr, "Failed to prepare CIF for '%s'\n", func_name);
+        free(arg_types);
+        free(args);
+        return -1;
+    }
+
+    free(arg_types);
+    *args_out = args;
+    *nargs_out = nargs;
+    return 0;
 }
 
-/* Call function using CTF-derived types */
-void* call_function_via_ctf(const char *lib_path, const char *func_name,
-                            void **arg_values, int nargs) {
-    void *result = NULL;
-    
-    /* Open shared library */
-    void *handle = dlopen(lib_path, RTLD_LAZY);
+void *call_function_via_ctf(const char *lib_path, const char *func_name,
+                            void **arg_values, size_t nargs) {
+    void *handle = NULL;
+    void *retval = NULL;
+    void (*func)(void);
+    ctf_ffi_context_t ctx;
+    ffi_type *rtype = NULL;
+    ffi_type **args = NULL;
+    ffi_cif cif;
+    size_t actual_nargs = 0;
+
+    handle = dlopen(lib_path, RTLD_LAZY);
     if (!handle) {
         fprintf(stderr, "dlopen failed: %s\n", dlerror());
         return NULL;
     }
-    
-    /* Initialize CTF */
-    ctf_ffi_context_t ctx;
-    if (ctf_ffi_init(&ctx, lib_path) != 0) {
-        dlclose(handle);
-        return NULL;
+
+    if (ctf_ffi_init(&ctx, lib_path) != 0)
+        goto fail;
+
+    if (build_cif_from_ctf(&ctx, func_name, &cif, &rtype, &args,
+                           &actual_nargs) != 0)
+        goto fail_ctx;
+
+    if (actual_nargs != nargs) {
+        fprintf(stderr, "Argument count mismatch for '%s': expected %zu, got %zu\n",
+                func_name, actual_nargs, nargs);
+        goto fail_ctx;
     }
-    
-    /* Prepare FFI types */
-    ffi_type *rtype;
-    ffi_type *args[MAX_ARGS];
-    ffi_cif cif;
-    
-    int actual_nargs = build_cif_from_ctf(&ctx, func_name, &cif, &rtype, args);
-    if (actual_nargs < 0) {
-        ctf_ffi_cleanup(&ctx);
-        dlclose(handle);
-        return NULL;
-    }
-    
-    /* Get function pointer */
-    void (*func)() = dlsym(handle, func_name);
+
+    *(void **)(&func) = dlsym(handle, func_name);
     if (!func) {
         fprintf(stderr, "dlsym failed: %s\n", dlerror());
-        ctf_ffi_cleanup(&ctx);
-        dlclose(handle);
-        return NULL;
+        goto fail_ctx;
     }
-    
-    /* Allocate return value buffer */
-    void *retval = NULL;
+
     if (rtype->size > 0) {
-        retval = malloc(rtype->size);
+        retval = calloc(1, rtype->size);
         if (!retval) {
             fprintf(stderr, "Failed to allocate return value buffer\n");
-            ctf_ffi_cleanup(&ctx);
-            dlclose(handle);
-            return NULL;
+            goto fail_ctx;
         }
     }
-    
-    /* Call function through libffi */
+
     ffi_call(&cif, FFI_FN(func), retval, arg_values);
-    
-    result = retval;
-    
-    /* Cleanup */
+    free(args);
     ctf_ffi_cleanup(&ctx);
     dlclose(handle);
-    
-    return result;
+    return retval;
+
+fail_ctx:
+    free(args);
+    ctf_ffi_cleanup(&ctx);
+fail:
+    free(retval);
+    dlclose(handle);
+    return NULL;
 }
 
-/* Utility: List all functions available in CTF */
 int list_ctf_functions(const char *lib_path) {
     int err;
     ctf_archive_t *arc = ctf_arc_open(lib_path, &err);
@@ -356,62 +361,55 @@ int list_ctf_functions(const char *lib_path) {
         fprintf(stderr, "Failed to open CTF archive (error %d)\n", err);
         return -1;
     }
-    
+
     ctf_file_t *ctf = ctf_arc_open_by_name(arc, NULL, &err);
     if (!ctf) {
         fprintf(stderr, "Failed to bind CTF (error %d)\n", err);
         ctf_arc_close(arc);
         return -1;
     }
-    
-    printf("Functions in %s:\n", lib_path);
-    
-    /* Iterate through labels to find functions */
-    ctf_next_t *i = NULL;
+
+    ctf_next_t *iter = NULL;
     ctf_id_t id;
-    while ((id = ctf_type_next(ctf, &i, NULL, 0)) != 0) {
-        int kind = ctf_type_kind(ctf, id);
-        if (kind == CTF_K_FUNCTION) {
+    printf("Functions in %s:\n", lib_path);
+    while ((id = ctf_type_next(ctf, &iter, NULL, 0)) != CTF_ERR) {
+        if (ctf_type_kind(ctf, id) == CTF_K_FUNCTION) {
             char name_buf[256];
             char *name = ctf_type_name(ctf, id, name_buf, sizeof(name_buf));
-            if (name) {
+            if (name)
                 printf("  - %s\n", name);
-            }
         }
     }
-    
+
+    /* ctf_type_next() returns CTF_ERR both on normal end-of-iteration and
+       on errors.  Distinguish the two before reporting success. */
+    if (ctf_errno(ctf) != ECTF_NEXT_END) {
+        fprintf(stderr, "Failed while iterating CTF types: %s\n",
+                ctf_errmsg(ctf_errno(ctf)));
+        ctf_next_destroy(iter);
+        ctf_arc_close(arc);
+        return -1;
+    }
+
+    ctf_next_destroy(iter);
     ctf_arc_close(arc);
     return 0;
 }
 
 #ifdef STANDALONE_TEST
-/* Standalone test program */
 int main(int argc, char *argv[]) {
-    if (argc < 3) {
-        fprintf(stderr, "Usage: %s <library.so> <function> [args...]\n", argv[0]);
+    if (argc != 3) {
+        fprintf(stderr, "Usage: %s <library.so> <function>\n", argv[0]);
         return 1;
     }
-    
-    const char *lib_path = argv[1];
-    const char *func_name = argv[2];
-    
-    /* Test: List functions */
-    printf("=== Listing CTF Functions ===\n");
-    list_ctf_functions(lib_path);
-    printf("\n");
-    
-    /* Test: Call function */
-    printf("=== Calling %s ===\n", func_name);
-    
-    /* Example: call a simple function with no arguments */
-    void *arg_values[] = { NULL };
-    void *result = call_function_via_ctf(lib_path, func_name, arg_values, 0);
-    
-    if (result) {
-        printf("Function returned: %p\n", result);
+
+    if (list_ctf_functions(argv[1]) != 0)
+        return 1;
+
+    printf("Calling %s\n", argv[2]);
+    void *result = call_function_via_ctf(argv[1], argv[2], NULL, 0);
+    if (result)
         free(result);
-    }
-    
-    return 0;
+    return result || strcmp(argv[2], "print_status") == 0 ? 0 : 1;
 }
 #endif
