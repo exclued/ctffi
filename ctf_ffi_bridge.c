@@ -225,13 +225,18 @@ int build_cif_from_ctf(ctf_ffi_context_t *ctx, const char *func_name,
     if (!ctx || !func_name || !cif || !rtype || !args_out || !nargs_out)
         return -1;
 
-    func_type_id = ctf_lookup_by_name(ctx->ctf, func_name);
+    /* Function names live in the ELF symbol namespace, not the C type
+       namespace.  ctf_lookup_by_name() therefore cannot find ordinary
+       functions such as add_numbers(). */
+    func_type_id = ctf_lookup_by_symbol_name(ctx->ctf, func_name);
     if (func_type_id == CTF_ERR) {
         fprintf(stderr, "Function '%s' not found in CTF\n", func_name);
         return -1;
     }
 
-    err = ctf_func_info(ctx->ctf, func_type_id, &finfo);
+    /* func_type_id is a CTF_K_FUNCTION type ID, so use the _type_ APIs.
+       ctf_func_info()/ctf_func_args() take ELF symbol indexes instead. */
+    err = ctf_func_type_info(ctx->ctf, func_type_id, &finfo);
     if (err != 0) {
         fprintf(stderr, "Failed to get function info for '%s'\n", func_name);
         return -1;
@@ -248,7 +253,7 @@ int build_cif_from_ctf(ctf_ffi_context_t *ctx, const char *func_name,
             return -1;
         }
 
-        err = ctf_func_args(ctx->ctf, func_type_id, nargs, arg_types);
+        err = ctf_func_type_args(ctx->ctf, func_type_id, nargs, arg_types);
         if (err != 0) {
             fprintf(stderr, "Failed to get arguments for '%s'\n", func_name);
             free(arg_types);
