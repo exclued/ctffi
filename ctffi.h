@@ -10,6 +10,7 @@ extern "C" {
 #endif
 
 #define CTFFI_TYPE_CACHE_SIZE 256
+#define CTFFI_UNSUPPORTED_UNION_ABI (-2)
 
 typedef struct {
     ctf_id_t id;
