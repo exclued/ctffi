@@ -19,14 +19,14 @@ if(NOT HAVE_GCTF)
 endif()
 
 add_library(ctffi STATIC ctf_ffi_bridge_phase1.c)
-target_include_directories(ctffi PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} PRIVATE ${CTF_INCLUDE_DIR})
+target_include_directories(ctffi PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${CTF_INCLUDE_DIR})
 target_link_libraries(ctffi PUBLIC PkgConfig::LIBFFI ${CTF_LIBRARY} ${CMAKE_DL_LIBS})
 target_compile_options(ctffi PRIVATE -Wall -Wextra -Wpedantic)
 
 add_library(test_ctf SHARED test_library.c)
 target_compile_options(test_ctf PRIVATE -gctf)
 
-# One diagnostic executable owns all integration tests.  Keeping the test
+# One diagnostic executable owns all integration tests. Keeping the test
 # harness separate from the library makes every CTF/libffi operation visible
 # in CI logs and permits manual-vs-automatic CIF comparisons.
 add_executable(ctffi_debug_tests ctffi_debug_tests.c)
