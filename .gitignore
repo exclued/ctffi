@@ -1,1 +1,10 @@
-Nothing to output - the modified file 'README.md' is a source/config file and no build artifacts, dependencies, or temp files were detected in the changes.
+build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile
+compile_commands.json
+*.o
+*.a
+*.so
