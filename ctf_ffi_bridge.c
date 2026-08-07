@@ -367,7 +367,7 @@ int list_ctf_functions(const char *lib_path) {
     ctf_next_t *iter = NULL;
     ctf_id_t id;
     printf("Functions in %s:\n", lib_path);
-    while ((id = ctf_type_next(ctf, &iter, NULL, 0)) != 0) {
+    while ((id = ctf_type_next(ctf, &iter, NULL, 0)) != CTF_ERR) {
         if (ctf_type_kind(ctf, id) == CTF_K_FUNCTION) {
             char name_buf[256];
             char *name = ctf_type_name(ctf, id, name_buf, sizeof(name_buf));
@@ -376,6 +376,17 @@ int list_ctf_functions(const char *lib_path) {
         }
     }
 
+    /* ctf_type_next() returns CTF_ERR both on normal end-of-iteration and
+       on errors.  Distinguish the two before reporting success. */
+    if (ctf_errno(ctf) != ECTF_NEXT_END) {
+        fprintf(stderr, "Failed while iterating CTF types: %s\n",
+                ctf_errmsg(ctf_errno(ctf)));
+        ctf_next_destroy(iter);
+        ctf_arc_close(arc);
+        return -1;
+    }
+
+    ctf_next_destroy(iter);
     ctf_arc_close(arc);
     return 0;
 }
