@@ -48,6 +48,8 @@ static int cache_add(ctf_ffi_context_t *ctx, ctf_id_t id, ffi_type *type,
 
 int ctf_ffi_init(ctf_ffi_context_t *ctx, const char *path) {
     int err;
+    if (!ctx || !path)
+        return -1;
     memset(ctx, 0, sizeof(*ctx));
     ctx->archive = ctf_arc_open(path, &err);
     if (!ctx->archive)
@@ -65,7 +67,7 @@ void ctf_ffi_cleanup(ctf_ffi_context_t *ctx) {
     if (!ctx)
         return;
     for (size_t i = 0; i < ctx->cache_count; ++i) {
-        if (ctx->cache[i].dynamic) {
+        if (ctx->cache[i].dynamic && ctx->cache[i].type) {
             free(ctx->cache[i].type->elements);
             free(ctx->cache[i].type);
         }
@@ -118,10 +120,14 @@ static int member_cb(const char *name, ctf_id_t member_type,
                      unsigned long offset, void *arg) {
     member_builder_t *b = arg;
     (void)name;
+
+    /* libffi has no bit-field representation.  CTF reports member offsets
+       in bits, so a non-byte-aligned member is a bit-field for our purposes. */
     if (offset % 8 != 0) {
         b->error = 1;
         return 1;
     }
+
     ffi_type *type = ctf_to_ffi_type(b->ctx, member_type);
     if (!type || append_member(b, type) != 0) {
         b->error = 1;
@@ -130,7 +136,7 @@ static int member_cb(const char *name, ctf_id_t member_type,
     return 0;
 }
 
-static int layout_struct(ffi_type *type) {
+static int layout_type(ffi_type *type) {
     ffi_cif cif;
     return ffi_prep_cif(&cif, FFI_DEFAULT_ABI, 0, type, NULL) == FFI_OK ? 0 : -1;
 }
@@ -141,27 +147,40 @@ static ffi_type *aggregate_type(ctf_ffi_context_t *ctx, ctf_id_t id,
     member_builder_t b = { .ctx = ctx };
     if (!result)
         return NULL;
+
     result->type = FFI_TYPE_STRUCT;
     if (cache_add(ctx, id, result, 1) != 0) {
         free(result);
         return NULL;
     }
 
-    if (ctf_member_iter(ctx->ctf, id, member_cb, &b) != 0 || b.error || !b.count) {
+    if (ctf_member_iter(ctx->ctf, id, member_cb, &b) != 0 ||
+        b.error || !b.count) {
         free(b.elements);
         return NULL;
     }
 
     if (is_union) {
-        ffi_type *largest = b.elements[0];
-        for (size_t i = 1; i < b.count; ++i) {
-            if (layout_struct(b.elements[i]) != 0) {
+        /* libffi has no union type.  Its documented representation is a
+           one-element FFI_TYPE_STRUCT whose size/alignment are set to the
+           maximum of all laid-out members. */
+        ffi_type *largest = NULL;
+        size_t max_size = 0;
+        unsigned short max_alignment = 0;
+
+        for (size_t i = 0; i < b.count; ++i) {
+            if (layout_type(b.elements[i]) != 0) {
                 free(b.elements);
                 return NULL;
             }
-            if (b.elements[i]->size > largest->size)
+            if (!largest || b.elements[i]->size > max_size) {
                 largest = b.elements[i];
+                max_size = b.elements[i]->size;
+            }
+            if (b.elements[i]->alignment > max_alignment)
+                max_alignment = b.elements[i]->alignment;
         }
+
         result->elements = malloc(2 * sizeof(*result->elements));
         if (!result->elements) {
             free(b.elements);
@@ -169,23 +188,27 @@ static ffi_type *aggregate_type(ctf_ffi_context_t *ctx, ctf_id_t id,
         }
         result->elements[0] = largest;
         result->elements[1] = NULL;
+        result->size = max_size;
+        result->alignment = max_alignment;
         free(b.elements);
     } else {
-        result->elements = realloc(b.elements, (b.count + 1) * sizeof(*result->elements));
+        result->elements = realloc(b.elements,
+                                   (b.count + 1) * sizeof(*result->elements));
         if (!result->elements)
             return NULL;
         result->elements[b.count] = NULL;
-    }
 
-    if (layout_struct(result) != 0) {
-        free(result->elements);
-        result->elements = NULL;
-        return NULL;
+        if (layout_type(result) != 0) {
+            free(result->elements);
+            result->elements = NULL;
+            return NULL;
+        }
     }
 
     ssize_t ctf_size = ctf_type_size(ctx->ctf, id);
     if (ctf_size < 0 || (size_t)ctf_size != result->size) {
-        fprintf(stderr, "CTF/libffi size mismatch for %s type %lu: CTF=%zd libffi=%zu\n",
+        fprintf(stderr,
+                "CTF/libffi size mismatch for %s type %lu: CTF=%zd libffi=%zu\n",
                 is_union ? "union" : "struct", (unsigned long)id,
                 ctf_size, result->size);
         return NULL;
@@ -196,9 +219,11 @@ static ffi_type *aggregate_type(ctf_ffi_context_t *ctx, ctf_id_t id,
 static ffi_type *ctf_to_ffi_type(ctf_ffi_context_t *ctx, ctf_id_t id) {
     if (!ctx || id == CTF_ERR)
         return NULL;
+
     id = ctf_type_resolve(ctx->ctf, id);
     if (id == CTF_ERR)
         return NULL;
+
     ffi_type *cached = cache_find(ctx, id);
     if (cached)
         return cached;
@@ -219,8 +244,12 @@ static ffi_type *ctf_to_ffi_type(ctf_ffi_context_t *ctx, ctf_id_t id) {
 int build_cif_from_ctf(ctf_ffi_context_t *ctx, const char *name,
                        ffi_cif *cif, ffi_type **rtype,
                        ffi_type ***args_out, size_t *nargs_out) {
-    ctf_id_t fn = ctf_lookup_by_symbol_name(ctx->ctf, name);
+    ctf_id_t fn;
     ctf_funcinfo_t info;
+    if (!ctx || !name || !cif || !rtype || !args_out || !nargs_out)
+        return -1;
+
+    fn = ctf_lookup_by_symbol_name(ctx->ctf, name);
     if (fn == CTF_ERR || ctf_func_type_info(ctx->ctf, fn, &info) != 0)
         return -1;
 
@@ -228,26 +257,39 @@ int build_cif_from_ctf(ctf_ffi_context_t *ctx, const char *name,
     ctf_id_t *ids = n ? calloc(n, sizeof(*ids)) : NULL;
     ffi_type **args = n ? calloc(n, sizeof(*args)) : NULL;
     if (n && (!ids || !args)) {
-        free(ids); free(args); return -1;
+        free(ids);
+        free(args);
+        return -1;
     }
+
     if (n && ctf_func_type_args(ctx->ctf, fn, n, ids) != 0) {
-        free(ids); free(args); return -1;
+        free(ids);
+        free(args);
+        return -1;
     }
 
     *rtype = ctf_to_ffi_type(ctx, info.ctc_return);
     if (!*rtype) {
-        free(ids); free(args); return -1;
+        free(ids);
+        free(args);
+        return -1;
     }
+
     for (size_t i = 0; i < n; ++i) {
         args[i] = ctf_to_ffi_type(ctx, ids[i]);
         if (!args[i]) {
-            free(ids); free(args); return -1;
+            free(ids);
+            free(args);
+            return -1;
         }
     }
     free(ids);
+
     if (ffi_prep_cif(cif, FFI_DEFAULT_ABI, (unsigned)n, *rtype, args) != FFI_OK) {
-        free(args); return -1;
+        free(args);
+        return -1;
     }
+
     *args_out = args;
     *nargs_out = n;
     return 0;
@@ -261,20 +303,29 @@ void *call_function_via_ctf(const char *path, const char *name,
     ffi_type **args = NULL;
     ffi_cif cif;
     size_t actual = 0;
-    if (!handle || ctf_ffi_init(&ctx, path) != 0)
+
+    if (!handle)
         return NULL;
-    if (build_cif_from_ctf(&ctx, name, &cif, &rtype, &args, &actual) != 0 || actual != nargs)
+    if (ctf_ffi_init(&ctx, path) != 0) {
+        dlclose(handle);
+        return NULL;
+    }
+    if (build_cif_from_ctf(&ctx, name, &cif, &rtype, &args, &actual) != 0 ||
+        actual != nargs)
         goto fail;
 
     void (*fn)(void) = (void (*)(void))dlsym(handle, name);
     if (!fn)
         goto fail;
+
     void *result = rtype->size ? calloc(1, rtype->size) : NULL;
     ffi_call(&cif, FFI_FN(fn), result, values);
+
     free(args);
     ctf_ffi_cleanup(&ctx);
     dlclose(handle);
     return result;
+
 fail:
     free(args);
     ctf_ffi_cleanup(&ctx);
