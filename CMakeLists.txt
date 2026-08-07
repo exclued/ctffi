@@ -5,7 +5,6 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
-include(CheckIncludeFile)
 include(GNUInstallDirs)
 
 find_package(PkgConfig REQUIRED)
@@ -26,4 +25,18 @@ target_include_directories(ctffi PRIVATE ${CTF_INCLUDE_DIR})
 target_link_libraries(ctffi PRIVATE PkgConfig::LIBFFI ${CTF_LIBRARY} ${CMAKE_DL_LIBS})
 target_compile_definitions(ctffi PRIVATE HAVE_LIBCTF)
 
-a dd_executable(ctffi_test ctf_ffi_bridge.c)
+target_compile_options(ctffi PRIVATE -Wall -Wextra -Wpedantic)
+
+add_executable(ctffi_test ctf_ffi_bridge.c)
+target_compile_definitions(ctffi_test PRIVATE STANDALONE_TEST HAVE_LIBCTF)
+target_include_directories(ctffi_test PRIVATE ${CTF_INCLUDE_DIR})
+target_link_libraries(ctffi_test PRIVATE PkgConfig::LIBFFI ${CTF_LIBRARY} ${CMAKE_DL_LIBS})
+target_compile_options(ctffi_test PRIVATE -Wall -Wextra -Wpedantic)
+
+add_library(test_ctf SHARED test_library.c)
+target_compile_options(test_ctf PRIVATE -g)
+
+include(CTest)
+if(BUILD_TESTING)
+    add_test(NAME smoke COMMAND ctffi_test $<TARGET_FILE:test_ctf> test_function_signature)
+endif()
