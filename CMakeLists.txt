@@ -34,10 +34,15 @@ target_include_directories(ctffi_test PRIVATE ${CTF_INCLUDE_DIR})
 target_link_libraries(ctffi_test PRIVATE PkgConfig::LIBFFI ${CTF_LIBRARY} ${CMAKE_DL_LIBS})
 target_compile_options(ctffi_test PRIVATE -Wall -Wextra -Wpedantic)
 
+add_executable(phase1_test phase1_test.c)
+target_link_libraries(phase1_test PRIVATE ctffi)
+target_compile_options(phase1_test PRIVATE -Wall -Wextra -Wpedantic)
+
 add_library(test_ctf SHARED test_library.c)
 target_compile_options(test_ctf PRIVATE -gctf)
 
 include(CTest)
 if(BUILD_TESTING)
     add_test(NAME smoke COMMAND ctffi_test $<TARGET_FILE:test_ctf> test_function_signature)
+    add_test(NAME phase1_aggregates COMMAND phase1_test $<TARGET_FILE:test_ctf>)
 endif()
