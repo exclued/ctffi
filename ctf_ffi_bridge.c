@@ -190,8 +190,7 @@ static int aggregate_member(const char *name, ctf_id_t member_type,
 }
 
 static int prepare_layout(ffi_type *type) {
-    ffi_cif cif;
-    return ffi_prep_cif(&cif, FFI_DEFAULT_ABI, 0, type, NULL) == FFI_OK ? 0 : -1;
+    return ffi_get_struct_offsets(FFI_DEFAULT_ABI, type, NULL) == FFI_OK ? 0 : -1;
 }
 
 static ffi_type *ctf_struct_to_ffi(ctf_ffi_context_t *ctx, ctf_id_t type_id) {
@@ -255,7 +254,7 @@ static ffi_type *ctf_union_to_ffi(ctf_ffi_context_t *ctx, ctf_id_t type_id) {
         return NULL;
     }
 
-    /* libffi emulates unions as a one-element struct.  Lay out every member
+    /* libffi emulates unions as a one-element struct. Lay out every member
        first, then select the largest member and the largest alignment. */
     ffi_type *largest = builder.elements[0];
     for (size_t i = 0; i < builder.count; ++i) {
