@@ -18,7 +18,7 @@ if(NOT HAVE_GCTF)
     message(FATAL_ERROR "The compiler must support -gctf to build the CTF test fixture")
 endif()
 
-add_library(ctffi STATIC ctf_ffi_bridge_phase1.c)
+add_library(ctffi STATIC ctf_ffi_bridge_phase2.c)
 target_include_directories(ctffi PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${CTF_INCLUDE_DIR})
 target_link_libraries(ctffi PUBLIC PkgConfig::LIBFFI ${CTF_LIBRARY} ${CMAKE_DL_LIBS})
 target_compile_options(ctffi PRIVATE -Wall -Wextra -Wpedantic)
@@ -26,15 +26,24 @@ target_compile_options(ctffi PRIVATE -Wall -Wextra -Wpedantic)
 add_library(test_ctf SHARED test_library.c)
 target_compile_options(test_ctf PRIVATE -gctf)
 
-# One diagnostic executable owns all integration tests. Keeping the test
-# harness separate from the library makes every CTF/libffi operation visible
-# in CI logs and permits manual-vs-automatic CIF comparisons.
+add_library(test_ctf_phase2 SHARED test_library_phase2.c)
+target_compile_options(test_ctf_phase2 PRIVATE -gctf)
+
+# One diagnostic executable owns all Phase 1 integration tests. Keeping the
+# test harness separate from the library makes every CTF/libffi operation
+# visible in CI logs and permits manual-vs-automatic CIF comparisons.
 add_executable(ctffi_debug_tests ctffi_debug_tests.c)
 target_link_libraries(ctffi_debug_tests PRIVATE ctffi)
 target_compile_options(ctffi_debug_tests PRIVATE -Wall -Wextra -Wpedantic)
+
+add_executable(ctffi_phase2_tests ctffi_phase2_tests.c)
+target_link_libraries(ctffi_phase2_tests PRIVATE ctffi)
+target_compile_options(ctffi_phase2_tests PRIVATE -Wall -Wextra -Wpedantic)
 
 include(CTest)
 if(BUILD_TESTING)
     add_test(NAME phase1_aggregates
              COMMAND ctffi_debug_tests $<TARGET_FILE:test_ctf>)
+    add_test(NAME phase2_type_handling
+             COMMAND ctffi_phase2_tests $<TARGET_FILE:test_ctf_phase2>)
 endif()
