@@ -29,6 +29,9 @@ target_compile_options(test_ctf PRIVATE -gctf)
 add_library(test_ctf_phase2 SHARED test_library_phase2.c)
 target_compile_options(test_ctf_phase2 PRIVATE -gctf)
 
+add_library(test_ctf_phase3 SHARED test_library_phase3.c)
+target_compile_options(test_ctf_phase3 PRIVATE -gctf)
+
 # One diagnostic executable owns all Phase 1 integration tests. Keeping the
 # test harness separate from the library makes every CTF/libffi operation
 # visible in CI logs and permits manual-vs-automatic CIF comparisons.
@@ -40,10 +43,16 @@ add_executable(ctffi_phase2_tests ctffi_phase2_tests.c)
 target_link_libraries(ctffi_phase2_tests PRIVATE ctffi)
 target_compile_options(ctffi_phase2_tests PRIVATE -Wall -Wextra -Wpedantic)
 
+add_executable(ctffi_phase3_tests ctffi_phase3_tests.c)
+target_link_libraries(ctffi_phase3_tests PRIVATE ctffi)
+target_compile_options(ctffi_phase3_tests PRIVATE -Wall -Wextra -Wpedantic)
+
 include(CTest)
 if(BUILD_TESTING)
     add_test(NAME phase1_aggregates
              COMMAND ctffi_debug_tests $<TARGET_FILE:test_ctf>)
     add_test(NAME phase2_type_handling
              COMMAND ctffi_phase2_tests $<TARGET_FILE:test_ctf_phase2>)
+    add_test(NAME phase3_arrays
+             COMMAND ctffi_phase3_tests $<TARGET_FILE:test_ctf_phase3>)
 endif()
