@@ -1,5 +1,6 @@
 #include "ctffi.h"
 #include <dlfcn.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -117,6 +118,8 @@ static ffi_type *float_type(ctf_file_t *ctf, ctf_id_t id) {
 static int append_member(member_builder_t *b, ffi_type *type) {
     if (b->count == b->capacity) {
         size_t n = b->capacity ? b->capacity * 2 : 4;
+        if (n < b->capacity || n > SIZE_MAX / sizeof(*b->elements))
+            return -1;
         ffi_type **p = realloc(b->elements, n * sizeof(*p));
         if (!p)
             return -1;
@@ -152,6 +155,61 @@ static size_t round_up(size_t value, unsigned alignment) {
     return (value + a - 1) / a * a;
 }
 
+static ffi_type *array_type(ctf_ffi_context_t *ctx, ctf_id_t id) {
+    ctf_arinfo_t info;
+    if (ctf_array_info(ctx->ctf, id, &info) != 0 || info.ctr_nelems == 0)
+        return NULL; /* VLA/zero-length array: no fixed libffi representation. */
+
+    ffi_type *element = ctf_to_ffi_type(ctx, info.ctr_contents);
+    if (!element)
+        return NULL;
+    if (info.ctr_nelems > SIZE_MAX / sizeof(ffi_type *))
+        return NULL;
+
+    ffi_type *result = calloc(1, sizeof(*result));
+    if (!result)
+        return NULL;
+    result->type = FFI_TYPE_STRUCT;
+    if (cache_add(ctx, id, result, 1) != 0) {
+        free(result);
+        return NULL;
+    }
+
+    size_t count = info.ctr_nelems;
+    result->elements = malloc((count + 1) * sizeof(*result->elements));
+    if (!result->elements) {
+        ctx->cache_count--;
+        free(result);
+        return NULL;
+    }
+    for (size_t i = 0; i < count; ++i)
+        result->elements[i] = element;
+    result->elements[count] = NULL;
+
+    if (layout_type(result) != 0) {
+        ctx->cache_count--;
+        free(result->elements);
+        free(result);
+        return NULL;
+    }
+
+    /* CTF encodes both ordinary arrays and SIMD vectors as CTF_K_ARRAY. The
+       Phase 3 contract intentionally handles only ordinary fixed-size arrays;
+       vectors require target-specific ABI classification and remain outside
+       this generic CTF-to-libffi mapping. */
+    ssize_t ctf_size = ctf_type_size(ctx->ctf, id);
+    if (ctf_size < 0 || (size_t)ctf_size != result->size) {
+        fprintf(stderr,
+                "CTF/libffi array layout mismatch for %lu: CTF size=%zd libffi size=%zu\n",
+                (unsigned long)id, ctf_size, result->size);
+        ctx->cache_count--;
+        free(result->elements);
+        free(result);
+        return NULL;
+    }
+    return result;
+}
+
 static ffi_type *aggregate_type(ctf_ffi_context_t *ctx, ctf_id_t id, int is_union) {
     ffi_type *result = calloc(1, sizeof(*result));
     member_builder_t b = { .ctx = ctx };
@@ -165,7 +223,9 @@ static ffi_type *aggregate_type(ctf_ffi_context_t *ctx, ctf_id_t id, int is_unio
     }
 
     if (ctf_member_iter(ctx->ctf, id, member_cb, &b) != 0 || b.error || !b.count) {
+        ctx->cache_count--;
         free(b.elements);
+        free(result);
         return NULL;
     }
 
@@ -175,7 +235,9 @@ static ffi_type *aggregate_type(ctf_ffi_context_t *ctx, ctf_id_t id, int is_unio
         unsigned max_alignment = 1;
         for (size_t i = 0; i < b.count; ++i) {
             if (layout_type(b.elements[i]) != 0) {
+                ctx->cache_count--;
                 free(b.elements);
+                free(result);
                 return NULL;
             }
             if (!largest || b.elements[i]->size > max_size) {
@@ -187,7 +249,9 @@ static ffi_type *aggregate_type(ctf_ffi_context_t *ctx, ctf_id_t id, int is_unio
         }
         result->elements = malloc(2 * sizeof(*result->elements));
         if (!result->elements) {
+            ctx->cache_count--;
             free(b.elements);
+            free(result);
             return NULL;
         }
         result->elements[0] = largest;
@@ -197,12 +261,16 @@ static ffi_type *aggregate_type(ctf_ffi_context_t *ctx, ctf_id_t id, int is_unio
         free(b.elements);
     } else {
         result->elements = realloc(b.elements, (b.count + 1) * sizeof(*result->elements));
-        if (!result->elements)
+        if (!result->elements) {
+            ctx->cache_count--;
+            free(result);
             return NULL;
+        }
         result->elements[b.count] = NULL;
         if (layout_type(result) != 0) {
+            ctx->cache_count--;
             free(result->elements);
-            result->elements = NULL;
+            free(result);
             return NULL;
         }
     }
@@ -218,6 +286,9 @@ static ffi_type *aggregate_type(ctf_ffi_context_t *ctx, ctf_id_t id, int is_unio
                 "CTF/libffi layout mismatch for %s %lu: CTF size=%zd libffi size=%zu\n",
                 is_union ? "union" : "struct", (unsigned long)id,
                 ctf_size, result->size);
+        ctx->cache_count--;
+        free(result->elements);
+        free(result);
         return NULL;
     }
     return result;
@@ -243,12 +314,7 @@ static ffi_type *ctf_to_ffi_type(ctf_ffi_context_t *ctx, ctf_id_t id) {
     case CTF_K_POINTER: return &ffi_type_pointer;
     case CTF_K_FUNCTION: return &ffi_type_pointer;
     case CTF_K_ENUM: return enum_type(ctx->ctf, id);
-    case CTF_K_ARRAY:
-        /* C arrays are not first-class libffi types. Function parameters have
-           already undergone array-to-pointer adjustment in CTF; an array
-           inside an aggregate requires dedicated layout support and remains
-           outside Phase 2. */
-        return NULL;
+    case CTF_K_ARRAY: return array_type(ctx, id);
     case CTF_K_STRUCT: return aggregate_type(ctx, id, 0);
     case CTF_K_UNION: return aggregate_type(ctx, id, 1);
     default: return NULL;
