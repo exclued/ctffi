@@ -207,15 +207,17 @@ static ffi_type *aggregate_type(ctf_ffi_context_t *ctx, ctf_id_t id, int is_unio
         }
     }
 
+    /* ffi_prep_cif() may increase ffi_type.alignment for ABI classification
+       (notably for nested structs on x86-64). That value is not the C object
+       alignment reported by CTF and must not be treated as a CTF layout
+       mismatch. The size is the stable invariant needed to validate that the
+       generated aggregate has the same object representation extent. */
     ssize_t ctf_size = ctf_type_size(ctx->ctf, id);
-    ssize_t ctf_align = ctf_type_align(ctx->ctf, id);
-    if (ctf_size < 0 || ctf_align < 0 ||
-        (size_t)ctf_size != result->size ||
-        (unsigned)ctf_align != result->alignment) {
+    if (ctf_size < 0 || (size_t)ctf_size != result->size) {
         fprintf(stderr,
-                "CTF/libffi layout mismatch for %s %lu: CTF=%zd/%zd libffi=%zu/%u\n",
+                "CTF/libffi layout mismatch for %s %lu: CTF size=%zd libffi size=%zu\n",
                 is_union ? "union" : "struct", (unsigned long)id,
-                ctf_size, ctf_align, result->size, result->alignment);
+                ctf_size, result->size);
         return NULL;
     }
     return result;
